@@ -112,6 +112,7 @@ describe('Raft protocol boundaries', () => {
         ]),
       ),
     ).toBeNull()
+    expect(parseRaftEventEnvelope(envelope([{ ...attachment(1), data: 'A'.repeat(1_024) }]))).toBeNull()
   })
 
   it('rejects malformed input responses instead of turning them into ordinary messages', () => {

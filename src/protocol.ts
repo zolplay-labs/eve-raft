@@ -18,6 +18,7 @@ import {
 } from './types.js'
 
 const IDENTIFIER = /^[A-Za-z0-9_-]{1,160}$/u
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u
 const MAX_CONTENT_CHARS = 100_000
 const MAX_TARGET_CHARS = 500
 const MAX_PNG_INFLATED_BYTES = RAFT_ATTACHMENTS_MAX_TOTAL_BYTES * 2
@@ -281,7 +282,9 @@ function parseAttachment(value: unknown): RaftAttachment | null {
     !Number.isSafeInteger(input.sizeBytes) ||
     (input.sizeBytes as number) <= 0 ||
     (input.sizeBytes as number) > RAFT_ATTACHMENT_MAX_BYTES ||
-    typeof input.data !== 'string'
+    typeof input.data !== 'string' ||
+    input.data.length > Math.ceil((input.sizeBytes as number) / 3) * 4 ||
+    !BASE64.test(input.data)
   ) {
     return null
   }

@@ -16,6 +16,8 @@ export interface SupervisedRuntimeOptions {
   evePort: number
   childCommand: string[]
   cwd?: string
+  childShutdownGraceMs?: number
+  childKillWaitMs?: number
 }
 
 export interface SupervisedRuntime {
@@ -29,6 +31,9 @@ interface ChildExit {
   code: number | null
   signal: NodeJS.Signals | null
 }
+
+const DEFAULT_CHILD_SHUTDOWN_GRACE_MS = 10_000
+const DEFAULT_CHILD_KILL_WAIT_MS = 5_000
 
 export interface RuntimeVersions {
   node: string
@@ -100,6 +105,36 @@ function childExit(child: ChildProcess): Promise<ChildExit> {
   })
 }
 
+async function waitForChildExit(exited: Promise<ChildExit>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      exited.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function terminateChild(
+  child: ChildProcess,
+  exited: Promise<ChildExit>,
+  shutdownGraceMs: number,
+  killWaitMs: number,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  child.kill('SIGTERM')
+  if (await waitForChildExit(exited, shutdownGraceMs)) return
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  await waitForChildExit(exited, killWaitMs)
+}
+
 async function waitForEve(origin: string, child: ChildProcess, signal: AbortSignal): Promise<void> {
   const deadline = Date.now() + 60_000
   while (Date.now() < deadline) {
@@ -135,6 +170,8 @@ export async function startSupervisedRuntime(options: SupervisedRuntimeOptions):
   const controller = new AbortController()
   let eveReady = false
   let stopping = false
+  let shutdownPromise: Promise<void> | null = null
+  let childTerminationPromise: Promise<void> | null = null
 
   const [command, ...args] = supervisedChildCommand(options.childCommand, options.eveHost, options.evePort)
   const child = spawn(command!, args, {
@@ -147,6 +184,13 @@ export async function startSupervisedRuntime(options: SupervisedRuntimeOptions):
     stdio: 'inherit',
   })
   const exited = childExit(child)
+  const shutdownGraceMs = options.childShutdownGraceMs ?? DEFAULT_CHILD_SHUTDOWN_GRACE_MS
+  const killWaitMs = options.childKillWaitMs ?? DEFAULT_CHILD_KILL_WAIT_MS
+
+  const stopChild = (): Promise<void> => {
+    childTerminationPromise ??= terminateChild(child, exited, shutdownGraceMs, killWaitMs)
+    return childTerminationPromise
+  }
 
   const healthServer = createServer((request, response) => {
     if (request.method !== 'GET' || request.url !== '/health') {
@@ -179,6 +223,18 @@ export async function startSupervisedRuntime(options: SupervisedRuntimeOptions):
     eveReady = true
     await service.initialize()
   })
+  const shutdown = (): Promise<void> => {
+    shutdownPromise ??= (async () => {
+      stopping = true
+      controller.abort()
+      try {
+        await stopChild()
+      } finally {
+        await closeServer(healthServer)
+      }
+    })()
+    return shutdownPromise
+  }
   const done = (async () => {
     try {
       await ready
@@ -193,9 +249,7 @@ export async function startSupervisedRuntime(options: SupervisedRuntimeOptions):
       service.setFatalError(error)
       throw error
     } finally {
-      controller.abort()
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
-      await closeServer(healthServer)
+      await shutdown()
     }
   })()
   void done.catch(() => undefined)
@@ -205,12 +259,7 @@ export async function startSupervisedRuntime(options: SupervisedRuntimeOptions):
     ready,
     done,
     async stop() {
-      if (stopping) return
-      stopping = true
-      controller.abort()
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
-      await exited.catch(() => undefined)
-      await closeServer(healthServer)
+      await shutdown()
     },
   }
 }

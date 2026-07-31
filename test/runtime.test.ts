@@ -77,4 +77,36 @@ describe('co-located Eve supervisor', () => {
       }),
     ).rejects.toThrow('loopback host')
   })
+
+  it('escalates shutdown when the Eve child ignores SIGTERM', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-runtime-stubborn-'))
+    const evePort = await unusedPort()
+    const childScript = [
+      "const http = require('node:http')",
+      "const host = process.argv[process.argv.indexOf('--host') + 1]",
+      "const port = Number(process.argv[process.argv.indexOf('--port') + 1])",
+      "const server = http.createServer((req, res) => { res.writeHead(req.url === '/eve/v1/health' ? 200 : 404); res.end() })",
+      'server.listen(port, host)',
+      "process.on('SIGTERM', () => {})",
+    ].join(';')
+    const runtime = await startSupervisedRuntime({
+      stateDirectory: directory,
+      healthHost: '127.0.0.1',
+      healthPort: 0,
+      eveHost: '127.0.0.1',
+      evePort,
+      childCommand: [process.execPath, '-e', childScript, '--'],
+      childShutdownGraceMs: 25,
+      childKillWaitMs: 250,
+    })
+
+    await runtime.ready
+    await expect(
+      Promise.race([
+        runtime.stop().then(() => 'stopped'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timed out'), 2_000)),
+      ]),
+    ).resolves.toBe('stopped')
+    await runtime.done
+  })
 })

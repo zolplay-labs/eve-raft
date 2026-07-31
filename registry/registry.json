@@ -1,0 +1,21 @@
+{
+  "$schema": "https://ui.shadcn.com/schema/registry.json",
+  "name": "zolplay-eve",
+  "homepage": "https://github.com/zolplay-labs/eve-raft",
+  "items": [
+    {
+      "name": "raft",
+      "type": "registry:item",
+      "title": "Raft",
+      "description": "Connect an Eve agent to Raft direct conversations, shared mentions, and assigned tasks.",
+      "dependencies": ["@zolplay/eve-raft@^0.1.0"],
+      "files": [
+        {
+          "path": "registry/channels/raft.ts",
+          "type": "registry:file",
+          "target": "agent/channels/raft.ts"
+        }
+      ]
+    }
+  ]
+}

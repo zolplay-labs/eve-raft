@@ -107,6 +107,14 @@ describe('shared invocation and system tasks', () => {
     expect(raft.sent.at(-1)).toMatchObject({ target: '#tasks:task-7' })
     expect(raft.reactions).toContainEqual({ messageId: 'task-7', emoji: '✅', operation: 'add' })
     expect(raft.tasks[0]?.status).toBe('in_review')
+
+    const canonical = raft.messages.get('task-7')
+    if (!canonical) throw new Error('Missing canonical task fixture')
+    raft.events.push(canonical)
+    expect(await service.drain()).toBe(0)
+    expect(await service.processNext()).toBe(false)
+    expect(raft.sent).toHaveLength(1)
+    expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
   })
 
   it.each(['missing', 'ambiguous'])('drops a %s system task resolution without blocking later work', async (mode) => {

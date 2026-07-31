@@ -54,6 +54,26 @@ describe('persistent state', () => {
     expect((await store.loadQueue()).events.map((event) => event.id)).toEqual(['message-2'])
   })
 
+  it('remembers completed canonical aliases across queue shifts and restarts', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-recent-events-'))
+    const store = new StateStore(directory)
+    await store.initialize()
+    const queue = await store.loadQueue()
+    await store.appendEvents(queue, [{ id: 'wake-event' }, { id: 'canonical-answer' }])
+
+    await store.checkpointHead(queue, 'wake-event', { canonicalId: 'canonical-answer' })
+    expect(queue.events.map((event) => event.id)).toEqual(['wake-event'])
+    await store.shiftEvent(queue, 'wake-event')
+
+    const restarted = new StateStore(directory)
+    const reloaded = await restarted.loadQueue()
+    expect(reloaded.recentEventIds).toEqual(['wake-event', 'canonical-answer'])
+    await expect(
+      restarted.appendEvents(reloaded, [{ id: 'wake-event' }, { id: 'canonical-answer' }]),
+    ).resolves.toMatchObject({ added: 0, consumed: 2 })
+    expect(reloaded.events).toEqual([])
+  })
+
   it('atomically defers a checkpointed head behind newer freshness context', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-defer-'))
     const store = new StateStore(directory)

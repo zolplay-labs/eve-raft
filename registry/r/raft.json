@@ -1,0 +1,21 @@
+{
+  "$schema": "https://ui.shadcn.com/schema/registry-item.json",
+  "name": "raft",
+  "title": "Raft",
+  "description": "Connect an Eve agent to Raft direct conversations, shared mentions, and assigned tasks.",
+  "dependencies": ["@zolplay/eve-raft@^0.1.0"],
+  "files": [
+    {
+      "path": "registry/channels/raft.ts",
+      "content": "import { createRaftChannel } from '@zolplay/eve-raft/channel'\n\nexport default createRaftChannel()\n",
+      "type": "registry:file",
+      "target": "agent/channels/raft.ts"
+    }
+  ],
+  "meta": {
+    "eve": {
+      "requires": ">=0.29.2 <0.30"
+    }
+  },
+  "type": "registry:item"
+}

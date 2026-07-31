@@ -253,10 +253,16 @@ export class RaftClient {
   }
 
   async resolveMessage(messageId: string): Promise<RawRaftMessage> {
-    const response = await jsonResponse<{ message?: RawRaftMessage }>(
-      await this.request(`/messages/${encodeURIComponent(messageId)}/resolve`),
-    )
-    if (!response.message) throw new Error(`Raft message ${messageId} could not be resolved`)
+    const requestPath = `/messages/${encodeURIComponent(messageId)}/resolve`
+    const response = await jsonResponse<{ message?: RawRaftMessage }>(await this.request(requestPath))
+    if (!response.message) {
+      throw new HttpResponseError(
+        404,
+        'message_not_found',
+        `Raft message ${messageId} could not be resolved`,
+        requestPath,
+      )
+    }
     return response.message
   }
 

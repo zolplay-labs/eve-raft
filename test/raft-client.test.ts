@@ -68,5 +68,6 @@ describe('Raft protocol client', () => {
     expect(server.activity).toHaveLength(1)
     expect(server.tasks[0]?.status).toBe('in_review')
     expect(server.taskClaims).toContainEqual({ channel: '#tasks', taskNumber: 7, operation: 'claim' })
+    await expect(client.resolveMessage('missing')).rejects.toMatchObject({ status: 404, code: 'message_not_found' })
   })
 })

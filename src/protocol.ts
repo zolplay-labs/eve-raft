@@ -476,7 +476,12 @@ export function raftUserContent(message: RaftMessage, text: string): string | Us
     }
     total += bytes.byteLength
     if (total > RAFT_ATTACHMENTS_MAX_TOTAL_BYTES) throw new Error('Raft attachments exceed the aggregate limit')
-    files.push({ type: 'file', data: bytes, mediaType: attachment.mediaType, filename: attachment.fileName })
+    files.push({
+      type: 'file',
+      data: attachment.data,
+      mediaType: attachment.mediaType,
+      filename: attachment.fileName,
+    })
   }
   return [{ type: 'text', text: text || 'Please review the attached files.' }, ...files]
 }

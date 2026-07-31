@@ -11,6 +11,10 @@ import { FakeRaftServer } from './fake-raft-server.ts'
 
 const execFile = promisify(execFileCallback)
 const root = path.resolve(import.meta.dirname, '..')
+const PNG_BYTES = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+)
 
 function stopProcess(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
@@ -165,14 +169,33 @@ describe('packed registry installation', () => {
       ])
       expect(raft.activity.length).toBeGreaterThan(0)
 
+      raft.attachments.set('packed-attachment', { bytes: PNG_BYTES, mediaType: 'image/png' })
+      raft.events.push({
+        seq: 2,
+        id: 'message-packed-attachment',
+        message_id: 'message-packed-attachment',
+        timestamp: '2026-07-31T00:00:01.000Z',
+        sender_type: 'human',
+        sender_name: 'cali',
+        channel_type: 'dm',
+        channel_name: raft.agentName,
+        content: 'hello with packed attachment',
+        attachments: [{ id: 'packed-attachment', filename: 'fixture.png' }],
+      })
+      const attachmentDeadline = Date.now() + 15_000
+      while (raft.sent.length < 2 && Date.now() < attachmentDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      expect(raft.sent.at(-1)).toMatchObject({ content: expect.stringContaining('hello with packed attachment') })
+
       await stopProcess(eve)
       eve = startFixture()
       expect(await waitForHealth(origin)).toMatchObject({ state: 'connected' })
       raft.events.push({
-        seq: 2,
+        seq: 3,
         id: 'message-after-restart',
         message_id: 'message-after-restart',
-        timestamp: '2026-07-31T00:00:01.000Z',
+        timestamp: '2026-07-31T00:00:02.000Z',
         sender_type: 'human',
         sender_name: 'cali',
         channel_type: 'dm',
@@ -180,7 +203,7 @@ describe('packed registry installation', () => {
         content: 'after restart',
       })
       const restartDeadline = Date.now() + 15_000
-      while (raft.sent.length < 2 && Date.now() < restartDeadline) {
+      while (raft.sent.length < 3 && Date.now() < restartDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 100))
       }
       expect(raft.sent.at(-1)).toMatchObject({ content: expect.stringContaining('after restart') })

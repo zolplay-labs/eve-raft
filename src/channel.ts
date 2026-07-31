@@ -230,9 +230,7 @@ export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
         const principal = principalContext(envelope)
         const auth = options.resolveAuth ? await options.resolveAuth(principal) : defaultRaftAuth(principal)
         const content = raftUserContent(message, markedText(mention.content, fingerprint))
-        const payload = message.inputResponses
-          ? { inputResponses: message.inputResponses, ...(message.content ? { message: content } : {}) }
-          : content
+        const payload = message.inputResponses ? { inputResponses: message.inputResponses } : content
         const session = await send(payload, {
           auth,
           continuationToken,

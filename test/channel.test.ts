@@ -154,6 +154,23 @@ describe('Raft channel', () => {
     })
   })
 
+  it('resumes requested input without also starting a message turn', async () => {
+    const channel = createRaftChannel({ channelToken: 'channel-secret' })
+    const harness = routeHarness({ existingSessionId: 'session-existing' })
+    const inputResponses = [{ requestId: 'approval-request', optionId: 'ship' }]
+
+    const response = await messageRoute(channel).handler(
+      request(envelope({ content: '1', inputResponses })),
+      harness.args as never,
+    )
+
+    expect(await response.json()).toMatchObject({ accepted: true, sessionId: 'session-existing' })
+    expect(harness.send).toHaveBeenCalledWith(
+      { inputResponses },
+      expect.objectContaining({ continuationToken: 'server-1:agent-1:dm:@Dex:message' }),
+    )
+  })
+
   it('ignores the connected agent and rejects callers without the channel token', async () => {
     const channel = createRaftChannel({ channelToken: 'channel-secret' })
     const harness = routeHarness()

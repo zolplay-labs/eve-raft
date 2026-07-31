@@ -18,4 +18,4 @@ RUN pnpm --dir fixtures/standalone build
 
 WORKDIR /app/fixtures/standalone
 
-CMD ["pnpm", "exec", "eve-raft", "start", "--data-dir", "/data", "--", "pnpm", "exec", "eve", "start"]
+CMD ["node", "/app/dist/cli.js", "start", "--data-dir", "/data", "--", "pnpm", "exec", "eve", "start"]

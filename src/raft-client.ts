@@ -351,10 +351,15 @@ export class RaftClient {
     return matches[0]!
   }
 
-  async claimTask(channel: string, taskNumber: number): Promise<void> {
+  async claimTask(channel: string, taskNumber: number, idempotencyKey: string): Promise<void> {
     const response = await jsonResponse<
       FreshnessHoldResponse | { results?: Array<{ success?: boolean; reason?: string }> }
-    >(await this.request('/tasks/claim', { method: 'POST', body: { channel, task_numbers: [taskNumber] } }))
+    >(
+      await this.request('/tasks/claim', {
+        method: 'POST',
+        body: { channel, task_numbers: [taskNumber], idempotencyKey },
+      }),
+    )
     if (isFreshnessHold(response)) throw new RaftFreshnessHoldError('task_claim', channel, response)
     const result = response.results?.[0]
     if (result?.success === false && result.reason !== 'already claimed by you') {
@@ -362,14 +367,22 @@ export class RaftClient {
     }
   }
 
-  async unclaimTask(channel: string, taskNumber: number): Promise<void> {
+  async unclaimTask(channel: string, taskNumber: number, idempotencyKey: string): Promise<void> {
     const response = await jsonResponse<{ success?: boolean }>(
-      await this.request('/tasks/unclaim', { method: 'POST', body: { channel, task_number: taskNumber } }),
+      await this.request('/tasks/unclaim', {
+        method: 'POST',
+        body: { channel, task_number: taskNumber, idempotencyKey },
+      }),
     )
     if (response.success !== true) throw new Error(`Could not unclaim task #${taskNumber}`)
   }
 
-  async advanceTaskStatus(channel: string, taskNumber: number, status: 'in_progress' | 'in_review'): Promise<void> {
+  async advanceTaskStatus(
+    channel: string,
+    taskNumber: number,
+    status: 'in_progress' | 'in_review',
+    idempotencyKey: string,
+  ): Promise<void> {
     const task = (await this.tasks(channel)).find((candidate) => candidate.taskNumber === taskNumber)
     if (!task || typeof task.status !== 'string') throw new Error(`Raft task #${taskNumber} returned no status`)
     const rank = { todo: 0, in_progress: 1, in_review: 2, done: 3, closed: 3 } as const
@@ -378,7 +391,7 @@ export class RaftClient {
     const response = await jsonResponse<FreshnessHoldResponse | { ok?: boolean }>(
       await this.request('/tasks/update-status', {
         method: 'POST',
-        body: { channel, task_number: taskNumber, status },
+        body: { channel, task_number: taskNumber, status, idempotencyKey },
       }),
     )
     if (isFreshnessHold(response)) throw new RaftFreshnessHoldError('task_status', channel, response)

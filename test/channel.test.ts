@@ -111,7 +111,7 @@ describe('Raft channel', () => {
       }),
     )
     expect(harness.send).toHaveBeenCalledWith(
-      'hello',
+      expect.stringMatching(/^<!-- eve-raft-event:[a-f0-9]{64} -->\nhello$/u),
       expect.objectContaining({
         auth: expect.objectContaining({ principalId: 'mapped:raft:server-1:human-1' }),
         continuationToken: 'server-1:agent-1:dm:@Dex:message',
@@ -140,7 +140,10 @@ describe('Raft channel', () => {
       newThread.args as never,
     )
     expect(await mentioned.json()).toMatchObject({ accepted: true, kind: 'session' })
-    expect(newThread.send).toHaveBeenLastCalledWith('please help', expect.any(Object))
+    expect(newThread.send).toHaveBeenLastCalledWith(
+      expect.stringMatching(/^<!-- eve-raft-event:[a-f0-9]{64} -->\nplease help$/u),
+      expect.any(Object),
+    )
 
     const continuedThread = routeHarness({ existingSessionId: 'session-existing' })
     const continued = await messageRoute(channel).handler(request(shared), continuedThread.args as never)

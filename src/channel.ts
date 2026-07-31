@@ -1,6 +1,6 @@
-import { timingSafeEqual } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 
-import { defineChannel, GET, POST } from 'eve/channels'
+import { defineChannel, GET, POST, type Session } from 'eve/channels'
 
 import {
   defaultRaftAuth,
@@ -14,6 +14,7 @@ import {
 import type { CreateRaftChannelOptions, RaftDispatchResponse, RaftPrincipalContext } from './types.js'
 
 const CHANNEL_TOKEN_HEADER = 'x-eve-raft-token'
+const TRANSPORT_MARKER = /^<!-- eve-raft-event:([a-f0-9]{64}) -->$/u
 
 export interface RaftChannelState {
   serverId: string
@@ -21,6 +22,21 @@ export interface RaftChannelState {
   target: string
   replyTarget: string
   messageId: string
+  lastEventFingerprint: string | null
+}
+
+interface RaftDeliveryPayload {
+  message?: unknown
+  inputResponses?: unknown
+  context?: unknown
+  outputSchema?: unknown
+}
+
+interface MutableRaftAdapter {
+  deliver: (
+    payload: RaftDeliveryPayload,
+    context: { state: RaftChannelState },
+  ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>
 }
 
 function tokenFrom(options: CreateRaftChannelOptions): string | null {
@@ -53,9 +69,125 @@ function principalContext(envelope: NonNullable<ReturnType<typeof parseRaftEvent
   }
 }
 
+function eventFingerprint(envelope: NonNullable<ReturnType<typeof parseRaftEventEnvelope>>): string {
+  return createHash('sha256')
+    .update(`${envelope.serverId}\0${envelope.agentId}\0${envelope.message.messageId}`)
+    .digest('hex')
+}
+
+function markerFor(fingerprint: string): string {
+  return `<!-- eve-raft-event:${fingerprint} -->`
+}
+
+function markedText(content: string, fingerprint: string): string {
+  return `${markerFor(fingerprint)}\n${content}`
+}
+
+function fingerprintFromMessage(message: unknown): string | null {
+  const text =
+    typeof message === 'string'
+      ? message
+      : Array.isArray(message)
+        ? message.find((part): part is { type: 'text'; text: string } =>
+            Boolean(part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string'),
+          )?.text
+        : null
+  const firstLine = text?.split('\n', 1)[0]
+  return firstLine ? (TRANSPORT_MARKER.exec(firstLine)?.[1] ?? null) : null
+}
+
+function attachIdempotentDelivery(channel: ReturnType<typeof defineChannel<RaftChannelState>>): void {
+  const adapter = (channel as unknown as { adapter?: MutableRaftAdapter }).adapter
+  if (!adapter || typeof adapter.deliver !== 'function') {
+    throw new Error('Installed Eve does not expose the validated channel delivery contract')
+  }
+  const deliver = adapter.deliver.bind(adapter)
+  adapter.deliver = (payload, context) => {
+    const { state } = context
+    const fingerprint = fingerprintFromMessage(payload.message)
+    if (fingerprint && fingerprint === state.lastEventFingerprint) return undefined
+    if (fingerprint) state.lastEventFingerprint = fingerprint
+    return deliver(payload, context)
+  }
+}
+
+const STREAM_SCAN_PAGE_SIZE = 256
+
+async function readStreamRange(
+  session: Session,
+  startIndex: number,
+  endIndex: number,
+): Promise<Array<{ index: number; type: unknown; data: Record<string, unknown> | undefined }>> {
+  const reader = (await session.getEventStream({ startIndex })).getReader()
+  const events: Array<{ index: number; type: unknown; data: Record<string, unknown> | undefined }> = []
+  try {
+    for (let index = startIndex; index <= endIndex; index += 1) {
+      const next = await reader.read()
+      if (next.done) break
+      const event = next.value as unknown as { type?: unknown; data?: Record<string, unknown> }
+      events.push({ index, type: event.type, data: event.data })
+    }
+    return events
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+}
+
+async function acceptedStreamStart(session: Session, fingerprint: string): Promise<number | null> {
+  const tail = await session.getStreamTailIndex()
+  if (tail < 0) return null
+  let endIndex = tail
+  let waitingBoundaries = 0
+  let requiredWaitingBoundaries: number | null = null
+  while (endIndex >= 0) {
+    const startIndex = Math.max(0, endIndex - STREAM_SCAN_PAGE_SIZE + 1)
+    const events = await readStreamRange(session, startIndex, endIndex)
+    if (requiredWaitingBoundaries === null) {
+      requiredWaitingBoundaries = events.at(-1)?.type === 'session.waiting' ? 2 : 1
+    }
+    for (const event of events) {
+      const turnId = typeof event.data?.turnId === 'string' ? event.data.turnId : null
+      if (
+        event.type !== 'message.received' ||
+        !turnId ||
+        typeof event.data?.message !== 'string' ||
+        event.data.message.split('\n', 1)[0] !== markerFor(fingerprint)
+      ) {
+        continue
+      }
+      const prefix = await readStreamRange(session, Math.max(0, event.index - 4), event.index)
+      return (
+        prefix.find((candidate) => candidate.type === 'turn.started' && candidate.data?.turnId === turnId)?.index ??
+        event.index
+      )
+    }
+    waitingBoundaries += events.filter((event) => event.type === 'session.waiting').length
+    if (startIndex === 0 || waitingBoundaries >= requiredWaitingBoundaries) return null
+    endIndex = startIndex - 1
+  }
+  return null
+}
+
+function acceptedResponse(
+  envelope: NonNullable<ReturnType<typeof parseRaftEventEnvelope>>,
+  sessionId: string,
+  streamStartIndex: number,
+): RaftDispatchResponse {
+  return {
+    accepted: true,
+    kind: 'session',
+    target: envelope.message.replyTarget,
+    messageId: envelope.message.messageId,
+    sessionId,
+    streamPath: `/eve/v1/raft/sessions/${encodeURIComponent(sessionId)}/stream`,
+    streamStartIndex,
+    task: taskFor(envelope.message),
+  }
+}
+
 export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
-  return defineChannel<RaftChannelState>({
-    state: { serverId: '', agentId: '', target: '', replyTarget: '', messageId: '' },
+  const channel = defineChannel<RaftChannelState>({
+    state: { serverId: '', agentId: '', target: '', replyTarget: '', messageId: '', lastEventFingerprint: null },
     routes: [
       POST('/eve/v1/raft/messages', async (request, { getSession, resolveActiveSession, send }) => {
         if (!authorized(request, options)) return Response.json({ ok: false, error: 'unauthorized' }, { status: 401 })
@@ -72,6 +204,7 @@ export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
         const message = envelope.message
         const continuationToken = `${envelope.serverId}:${envelope.agentId}:${message.replyTarget}`
         const existing = await resolveActiveSession({ continuationToken })
+        const fingerprint = eventFingerprint(envelope)
         const mention = stripAgentMention(message.content, envelope.agentName)
         const direct = raftSurface(message) === 'direct'
         const assignedTask =
@@ -85,6 +218,10 @@ export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
           return Response.json(ignored)
         }
 
+        if (existing) {
+          const priorStart = await acceptedStreamStart(getSession(existing.sessionId), fingerprint).catch(() => null)
+          if (priorStart !== null) return Response.json(acceptedResponse(envelope, existing.sessionId, priorStart))
+        }
         const previousTail = existing
           ? await getSession(existing.sessionId)
               .getStreamTailIndex()
@@ -92,7 +229,7 @@ export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
           : null
         const principal = principalContext(envelope)
         const auth = options.resolveAuth ? await options.resolveAuth(principal) : defaultRaftAuth(principal)
-        const content = raftUserContent(message, mention.content)
+        const content = raftUserContent(message, markedText(mention.content, fingerprint))
         const payload = message.inputResponses
           ? { inputResponses: message.inputResponses, ...(message.content ? { message: content } : {}) }
           : content
@@ -106,22 +243,17 @@ export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
             target: message.target,
             replyTarget: message.replyTarget,
             messageId: message.messageId,
+            lastEventFingerprint: null,
           },
           title: taskFor(message)
             ? `Raft task #${message.taskNumber}`
             : `${principal.surface === 'direct' ? 'Raft DM' : 'Raft thread'} with @${message.senderName}`,
         })
-        const response: RaftDispatchResponse = {
-          accepted: true,
-          kind: 'session',
-          target: message.replyTarget,
-          messageId: message.messageId,
-          sessionId: session.id,
-          streamPath: `/eve/v1/raft/sessions/${encodeURIComponent(session.id)}/stream`,
-          streamStartIndex:
-            existing && session.id === existing.sessionId && previousTail !== null ? previousTail + 1 : 0,
-          task: taskFor(message),
-        }
+        const response = acceptedResponse(
+          envelope,
+          session.id,
+          existing && session.id === existing.sessionId && previousTail !== null ? previousTail + 1 : 0,
+        )
         return Response.json(response)
       }),
       GET('/eve/v1/raft/sessions/:sessionId/stream', async (request, { getSession, params }) => {
@@ -147,4 +279,6 @@ export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
       }),
     ],
   })
+  attachIdempotentDelivery(channel)
+  return channel
 }

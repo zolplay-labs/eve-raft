@@ -58,7 +58,7 @@ The included [Dockerfile](./Dockerfile) builds the standalone fixture and [railw
 
 5. Approve the printed device URL. The running service notices the stored credential without adding an environment variable or rebuilding the image.
 
-The volume owns `credential.json`, `settings.json`, `queue.json`, and `pending-input.json`. Directories use mode `0700`; credential and settings files use `0600`.
+The volume owns `credential.json`, `settings.json`, `queue.json`, `pending-events.json`, and `pending-input.json`. Directories use mode `0700`; persisted state files use `0600`.
 
 `GET /health` contains only process liveness, exact Node/Eve/Eve Raft versions, the supported protocol version, the configured server origin, connection state, queue depth, and coarse error codes. It omits raw Raft server, agent, and profile identifiers and never includes credentials, device codes, message content, attachments, prompts, model output, or tool details.
 

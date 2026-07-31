@@ -8,6 +8,7 @@ interface FakeSession {
   id: string
   continuationToken: string
   events: Record<string, unknown>[]
+  state: Record<string, unknown>
   getEventStream(options?: { startIndex?: number }): Promise<ReadableStream<Record<string, unknown>>>
   getStreamTailIndex(): Promise<number>
 }
@@ -51,7 +52,9 @@ export class FakeEveServer {
   private sequence = 0
   failNextStream = false
   failNextDispatch = false
+  failNextDispatchAfterAccept = false
   emptyNextResult = false
+  onInput: ((input: unknown) => void) | null = null
   origin = ''
 
   constructor(readonly channelToken: string) {}
@@ -65,18 +68,42 @@ export class FakeEveServer {
       (route) => route.method === 'GET' && route.path === '/eve/v1/raft/sessions/:sessionId/stream',
     ) as HttpRouteDefinition<unknown> | undefined
     if (!messageRoute || !streamRoute) throw new Error('Fake Eve server could not find Raft routes')
+    const adapter = (
+      channel as unknown as {
+        adapter?: {
+          deliver?: (
+            payload: Record<string, unknown>,
+            context: { state: Record<string, unknown> },
+          ) => Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>
+        }
+      }
+    ).adapter
 
     const send = async (input: unknown, options: Record<string, unknown>) => {
-      this.inputs.push({ input, options })
       const token = String(options.continuationToken)
       let session = this.sessionsByToken.get(token)
       if (!session) {
         const id = `session-${++this.sequence}`
-        session = this.createSession(id, token)
+        const state =
+          options.state && typeof options.state === 'object' && !Array.isArray(options.state)
+            ? structuredClone(options.state as Record<string, unknown>)
+            : {}
+        session = this.createSession(id, token, state)
         this.sessionsByToken.set(token, session)
         this.sessionsById.set(id, session)
       }
+      if (adapter?.deliver) {
+        const payload =
+          input && typeof input === 'object' && !Array.isArray(input)
+            ? (input as Record<string, unknown>)
+            : { message: input }
+        const delivered = await adapter.deliver(payload, { state: session.state })
+        if (delivered === undefined) return session
+      }
+      this.inputs.push({ input, options })
+      this.onInput?.(input)
       const turnId = `turn-${this.inputs.length}`
+      const receivedMessage = textFromInput(input)
       const responses =
         input &&
         typeof input === 'object' &&
@@ -87,6 +114,7 @@ export class FakeEveServer {
       if (responses) {
         session.events.push(
           { type: 'turn.started', data: { turnId } },
+          { type: 'message.received', data: { turnId, message: receivedMessage } },
           {
             type: 'message.completed',
             data: { turnId, finishReason: 'stop', message: `Resumed: ${responses[0]?.optionId ?? responses[0]?.text}` },
@@ -97,6 +125,7 @@ export class FakeEveServer {
       } else if (textFromInput(input).toLowerCase().includes('ask me')) {
         session.events.push(
           { type: 'turn.started', data: { turnId } },
+          { type: 'message.received', data: { turnId, message: receivedMessage } },
           {
             type: 'input.requested',
             data: {
@@ -122,6 +151,7 @@ export class FakeEveServer {
         this.emptyNextResult = false
         session.events.push(
           { type: 'turn.started', data: { turnId } },
+          { type: 'message.received', data: { turnId, message: receivedMessage } },
           {
             type: 'actions.requested',
             data: {
@@ -197,6 +227,12 @@ export class FakeEveServer {
         const webResponse = streamMatch
           ? await streamRoute.handler(webRequest, args({ sessionId: decodeURIComponent(streamMatch[1]!) }) as never)
           : await messageRoute.handler(webRequest, args() as never)
+        if (!streamMatch && this.failNextDispatchAfterAccept) {
+          this.failNextDispatchAfterAccept = false
+          outgoing.writeHead(503, { 'content-type': 'application/json' })
+          outgoing.end(JSON.stringify({ error: 'response_lost_after_accept' }))
+          return
+        }
         await writeWebResponse(outgoing, webResponse)
       } catch (error) {
         outgoing.writeHead(500, { 'content-type': 'text/plain' })
@@ -214,12 +250,13 @@ export class FakeEveServer {
     await new Promise<void>((resolve, reject) => this.server!.close((error) => (error ? reject(error) : resolve())))
   }
 
-  private createSession(id: string, continuationToken: string): FakeSession {
+  private createSession(id: string, continuationToken: string, state: Record<string, unknown>): FakeSession {
     const events: Record<string, unknown>[] = []
     return {
       id,
       continuationToken,
       events,
+      state,
       getEventStream: async ({ startIndex = 0 } = {}) =>
         new ReadableStream({
           start(controller) {

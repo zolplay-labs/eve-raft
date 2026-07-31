@@ -54,9 +54,9 @@ describe('Raft protocol client', () => {
         occurredAt: '2026-07-31T00:00:00.000Z',
       },
     ])
-    await client.claimTask('#tasks', 7)
-    await client.advanceTaskStatus('#tasks', 7, 'in_progress')
-    await client.advanceTaskStatus('#tasks', 7, 'in_review')
+    await client.claimTask('#tasks', 7, 'claim-task-7')
+    await client.advanceTaskStatus('#tasks', 7, 'in_progress', 'start-task-7')
+    await client.advanceTaskStatus('#tasks', 7, 'in_review', 'review-task-7')
 
     expect(server.sent).toEqual([
       { target: '#general:message', content: 'reply', idempotencyKey: 'reply-message-1', seenUpToSeq: 12 },

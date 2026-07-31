@@ -67,11 +67,18 @@ export interface PendingInputFile {
   byReplyTarget: Record<string, PendingInputRequest[]>
 }
 
+export interface PendingEventsFile {
+  schemaVersion: 1
+  events: RawRaftMessage[]
+}
+
 const MAX_QUEUE_EVENTS = 1_000
 const MAX_QUEUE_BYTES = 16 * 1024 * 1024
 const MAX_PENDING_TARGETS = 1_000
 const MAX_PENDING_REQUESTS_PER_TARGET = 100
 const MAX_PENDING_OPTIONS_PER_REQUEST = 100
+const MAX_PENDING_PAGE_EVENTS = 10_000
+const MAX_PENDING_PAGE_BYTES = MAX_QUEUE_BYTES * 2
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -202,6 +209,7 @@ export class StateStore {
   readonly credentialPath: string
   readonly settingsPath: string
   readonly queuePath: string
+  readonly pendingEventsPath: string
   readonly pendingInputPath: string
 
   constructor(directory: string) {
@@ -209,6 +217,7 @@ export class StateStore {
     this.credentialPath = path.join(this.directory, 'credential.json')
     this.settingsPath = path.join(this.directory, 'settings.json')
     this.queuePath = path.join(this.directory, 'queue.json')
+    this.pendingEventsPath = path.join(this.directory, 'pending-events.json')
     this.pendingInputPath = path.join(this.directory, 'pending-input.json')
   }
 
@@ -268,6 +277,32 @@ export class StateStore {
   async loadQueue(): Promise<QueueFile> {
     const value = await readJson(this.queuePath)
     return value === null ? { schemaVersion: 1, events: [] } : validateQueue(value)
+  }
+
+  async loadPendingEvents(): Promise<PendingEventsFile> {
+    const value = await readJson(this.pendingEventsPath, MAX_PENDING_PAGE_BYTES)
+    if (
+      value === null ||
+      (isRecord(value) &&
+        value.schemaVersion === 1 &&
+        Array.isArray(value.events) &&
+        value.events.length <= MAX_PENDING_PAGE_EVENTS &&
+        value.events.every(isRecord))
+    ) {
+      return value === null ? { schemaVersion: 1, events: [] } : (value as unknown as PendingEventsFile)
+    }
+    throw new Error('Stored pending Raft event page is invalid')
+  }
+
+  async savePendingEvents(events: RawRaftMessage[]): Promise<void> {
+    if (
+      events.length > MAX_PENDING_PAGE_EVENTS ||
+      !events.every(isRecord) ||
+      Buffer.byteLength(JSON.stringify({ schemaVersion: 1, events })) > MAX_PENDING_PAGE_BYTES
+    ) {
+      throw new Error('Pending Raft event page exceeds its durable bounds')
+    }
+    await writeJsonAtomic(this.pendingEventsPath, { schemaVersion: 1, events })
   }
 
   async appendEvents(

@@ -1,6 +1,6 @@
 {
   "name": "@zolplay/eve-raft",
-  "version": "0.0.0-development",
+  "version": "0.1.0",
   "description": "Raft channel integration for Eve agents",
   "keywords": [
     "eve",

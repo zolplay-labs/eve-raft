@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 
-import { attachmentMatchesMediaType } from './protocol.js'
+import { attachmentMatchesMediaType, stripRaftTransportMarkers } from './protocol.js'
 import { HttpResponseError, RaftClient, RaftFreshnessHoldError, type RaftProfile } from './raft-client.js'
 import {
   type PendingInputFile,
@@ -31,6 +31,10 @@ const IDENTIFIER = /^[A-Za-z0-9_-]{1,160}$/u
 
 function hash(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function taskMutationKey(eventId: string, operation: 'claim' | 'unclaim' | 'in-progress' | 'in-review'): string {
+  return `eve-raft-task-${operation}-${hash(eventId)}`
 }
 
 function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -135,6 +139,26 @@ function rawTask(message: RawRaftMessage): { channel: string; number: number; ti
     channel: channelType === 'thread' ? target.slice(0, target.lastIndexOf(':')) : target,
     ...reference,
   }
+}
+
+function rawAssignedTask(
+  message: RawRaftMessage,
+  agentId: string,
+): { channel: string; number: number; title: string | null } | null {
+  const task = rawTask(message)
+  if (!task) return null
+  if (rawTaskNotice(message)) return task
+  return rawTaskValue(message, 'taskAssigneeType', 'task_assignee_type') === 'agent' &&
+    rawTaskValue(message, 'taskAssigneeId', 'task_assignee_id') === agentId
+    ? task
+    : null
+}
+
+function checkpointedTask(event: QueuedRaftEvent, agentId: string): { channel: string; number: number } | null {
+  if (event.dispatch?.task) return event.dispatch.task
+  const reference = rawTaskReference(event.message)
+  if (!reference || !event.taskAnchor || !rawAssignedTask(event.message, agentId)) return null
+  return { channel: event.taskAnchor.taskChannel, number: reference.number }
 }
 
 function safeFileName(value: string): string {
@@ -323,6 +347,7 @@ export class EveRaftService {
     if (this.initialized) return
     await this.store.initialize()
     this.queue = await this.store.loadQueue()
+    this.pendingEvents = (await this.store.loadPendingEvents()).events
     this.pendingInput = await this.store.loadPendingInput()
     this.health.queueDepth = this.queue.events.length
     if (!(await this.connectStoredCredential())) {
@@ -378,9 +403,11 @@ export class EveRaftService {
     if (this.pendingEvents.length === 0) {
       const response = await this.raft!.drainOnce()
       this.pendingEvents = Array.isArray(response.events) ? response.events : []
+      await this.store.savePendingEvents(this.pendingEvents)
     }
     const result = await this.store.appendEvents(this.queue, this.pendingEvents)
     this.pendingEvents.splice(0, result.consumed)
+    await this.store.savePendingEvents(this.pendingEvents)
     for (const messageId of result.dropped) await this.bestEffortReaction(messageId, '⚠️')
     this.health.queueDepth = this.queue.events.length
     return result.added
@@ -426,13 +453,9 @@ export class EveRaftService {
         (error instanceof HttpResponseError && [400, 404, 410, 422].includes(error.status))
       ) {
         const checkpointed = this.queue.events[0]
-        if (
-          checkpointed?.id === event.id &&
-          checkpointed.taskPhase === 'started' &&
-          !checkpointed.replyDelivered &&
-          checkpointed.dispatch?.task
-        ) {
-          await this.raft!.unclaimTask(checkpointed.dispatch.task.channel, checkpointed.dispatch.task.number)
+        if (checkpointed?.id === event.id && checkpointed.taskPhase === 'started' && !checkpointed.replyDelivered) {
+          const task = checkpointedTask(checkpointed, this.credential!.agentId)
+          if (task) await this.raft!.unclaimTask(task.channel, task.number, taskMutationKey(event.id, 'unclaim'))
         }
         await this.bestEffortReaction(
           checkpointed?.taskAnchor?.messageId ?? event.taskAnchor?.messageId ?? event.id,
@@ -466,7 +489,7 @@ export class EveRaftService {
     if (malformedSendCursor) {
       if (startedTask) {
         const task = checkpointed.dispatch?.task
-        if (task) await this.raft!.unclaimTask(task.channel, task.number)
+        if (task) await this.raft!.unclaimTask(task.channel, task.number, taskMutationKey(event.id, 'unclaim'))
       }
       await this.markFailure(checkpointed.taskAnchor?.messageId ?? event.id)
       await this.store.replaceHeadWithEvents(this.queue, event.id, messages)
@@ -540,7 +563,7 @@ export class EveRaftService {
   private async processEvent(event: QueuedRaftEvent): Promise<void> {
     this.assertConnected()
     const raw = event.message
-    const task = rawTask(raw)
+    const task = rawAssignedTask(raw, this.credential!.agentId)
     const systemTask = rawSenderType(raw) === 'system' ? task : null
     let taskAnchor = event.taskAnchor
     if (systemTask && !taskAnchor) {
@@ -558,6 +581,36 @@ export class EveRaftService {
     const effectiveTask = systemTask && taskAnchor ? { ...systemTask, channel: taskAnchor.taskChannel } : task
     const reactionMessageId = taskAnchor?.messageId ?? event.id
     const normalized = await this.normalizeMessage(raw, taskAnchor?.replyTarget, effectiveTask)
+    if (effectiveTask && !taskAnchor) {
+      taskAnchor = {
+        messageId: reactionMessageId,
+        replyTarget: normalized.replyTarget,
+        taskChannel: effectiveTask.channel,
+      }
+      await this.store.checkpointHead(this.queue, event.id, { taskAnchor })
+    }
+    await this.bestEffortReaction(reactionMessageId, '👀')
+    let taskPhase = event.taskPhase
+    if (effectiveTask && taskPhase === undefined) {
+      await this.raft!.claimTask(effectiveTask.channel, effectiveTask.number, taskMutationKey(event.id, 'claim'))
+      try {
+        await this.raft!.advanceTaskStatus(
+          effectiveTask.channel,
+          effectiveTask.number,
+          'in_progress',
+          taskMutationKey(event.id, 'in-progress'),
+        )
+      } catch (error) {
+        await this.raft!.unclaimTask(
+          effectiveTask.channel,
+          effectiveTask.number,
+          taskMutationKey(event.id, 'unclaim'),
+        ).catch(() => undefined)
+        throw error
+      }
+      await this.store.checkpointHead(this.queue, event.id, { taskPhase: 'started' })
+      taskPhase = 'started'
+    }
     let dispatch = event.dispatch
     if (!dispatch) {
       const response = await this.eve.dispatch({
@@ -567,7 +620,10 @@ export class EveRaftService {
         agentName: this.credential!.agentName,
         message: normalized,
       })
-      if (!response.accepted) return
+      if (!response.accepted) {
+        if (effectiveTask) throw new PermanentEventError('assigned_task_ignored')
+        return
+      }
       dispatch = {
         target: response.target,
         messageId: response.messageId,
@@ -583,16 +639,8 @@ export class EveRaftService {
       await this.store.savePendingInput(this.pendingInput)
     }
 
-    await this.bestEffortReaction(reactionMessageId, '👀')
     const deliveryTask = dispatch.task
-    let taskPhase = event.taskPhase
     let replyDelivered = event.replyDelivered === true
-    if (deliveryTask && taskPhase === undefined) {
-      await this.raft!.claimTask(deliveryTask.channel, deliveryTask.number)
-      await this.raft!.advanceTaskStatus(deliveryTask.channel, deliveryTask.number, 'in_progress')
-      await this.store.checkpointHead(this.queue, event.id, { taskPhase: 'started' })
-      taskPhase = 'started'
-    }
 
     const seenUpToSeq = Math.max(normalized.seq ?? -1, event.freshnessSeenUpToSeq ?? -1)
     const cursor = seenUpToSeq >= 0 ? seenUpToSeq : undefined
@@ -622,18 +670,14 @@ export class EveRaftService {
           cursor,
         )
         if (deliveryTask && taskPhase === 'started')
-          await this.raft!.unclaimTask(deliveryTask.channel, deliveryTask.number)
+          await this.raft!.unclaimTask(deliveryTask.channel, deliveryTask.number, taskMutationKey(event.id, 'unclaim'))
         await this.markFailure(reactionMessageId)
         return
       }
       if (deliveryTask && !outcome.message) throw new PermanentEventError('task_result_missing')
       if (outcome.message) {
-        await this.raft!.send(
-          dispatch.target,
-          outcome.message,
-          `eve-raft-final-${hash(`${event.id}:${outcome.turnId}`)}`,
-          cursor,
-        )
+        const reply = stripRaftTransportMarkers(outcome.message)
+        await this.raft!.send(dispatch.target, reply, `eve-raft-final-${hash(`${event.id}:${outcome.turnId}`)}`, cursor)
       }
       await this.store.checkpointHead(this.queue, event.id, {
         replyDelivered: true,
@@ -644,7 +688,12 @@ export class EveRaftService {
     }
 
     if (deliveryTask && replyDelivered && taskPhase === 'delivered') {
-      await this.raft!.advanceTaskStatus(deliveryTask.channel, deliveryTask.number, 'in_review')
+      await this.raft!.advanceTaskStatus(
+        deliveryTask.channel,
+        deliveryTask.number,
+        'in_review',
+        taskMutationKey(event.id, 'in-review'),
+      )
       await this.store.checkpointHead(this.queue, event.id, { taskPhase: 'reviewed' })
       taskPhase = 'reviewed'
     }
@@ -655,7 +704,10 @@ export class EveRaftService {
   private async normalizeMessage(
     raw: RawRaftMessage,
     replyTargetOverride?: string,
-    task: { channel: string; number: number; title: string | null } | null = rawTask(raw),
+    task: { channel: string; number: number; title: string | null } | null = rawAssignedTask(
+      raw,
+      this.credential!.agentId,
+    ),
   ): Promise<RaftMessage> {
     const rawId = rawMessageId(raw)
     const senderName = rawSenderName(raw)

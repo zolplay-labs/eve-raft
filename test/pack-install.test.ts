@@ -51,6 +51,11 @@ describe('packed registry installation', () => {
     const tarballName = packed.stdout.trim().split('\n').at(-1)
     if (!tarballName) throw new Error('pnpm pack did not return an artifact path')
     const tarball = path.isAbsolute(tarballName) ? tarballName : path.join(packDirectory, tarballName)
+    const packedManifest = JSON.parse((await execFile('tar', ['-xOf', tarball, 'package/package.json'])).stdout) as {
+      name?: unknown
+      version?: unknown
+    }
+    expect(packedManifest).toMatchObject({ name: '@zolplay/eve-raft', version: '0.1.0' })
 
     const fixturePackage = {
       name: 'eve-raft-packed-fixture',
@@ -71,6 +76,7 @@ describe('packed registry installation', () => {
     const registryItem = JSON.parse(await readFile(path.join(root, 'registry/r/raft.json'), 'utf8')) as {
       dependencies: string[]
     }
+    expect(registryItem.dependencies).toEqual([`@zolplay/eve-raft@^${packedManifest.version}`])
     registryItem.dependencies = [`@zolplay/eve-raft@file:${tarball}`]
     let registryServer: Server | null = createServer((request, response) => {
       if (request.url !== '/r/raft.json') {

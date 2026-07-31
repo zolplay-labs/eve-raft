@@ -1,4 +1,5 @@
 import type { UserContent } from 'ai'
+import { inflateSync } from 'node:zlib'
 
 import {
   RAFT_ATTACHMENT_MAX_BYTES,
@@ -19,6 +20,7 @@ import {
 const IDENTIFIER = /^[A-Za-z0-9_-]{1,160}$/u
 const MAX_CONTENT_CHARS = 100_000
 const MAX_TARGET_CHARS = 500
+const MAX_PNG_INFLATED_BYTES = RAFT_ATTACHMENTS_MAX_TOTAL_BYTES * 2
 
 function boundedString(value: unknown, max: number, allowEmpty = false): string | null {
   return typeof value === 'string' && value.length <= max && (allowEmpty || value.length > 0) ? value : null
@@ -36,32 +38,234 @@ export function isRaftAttachmentMediaType(value: unknown): value is RaftAttachme
   return typeof value === 'string' && (RAFT_ATTACHMENT_MEDIA_TYPES as readonly string[]).includes(value)
 }
 
-export function attachmentMatchesMediaType(bytes: Uint8Array, mediaType: RaftAttachmentMediaType): boolean {
+function isPdf(bytes: Uint8Array): boolean {
   const buffer = Buffer.from(bytes)
-  if (mediaType === 'application/pdf') {
-    const header = buffer.subarray(0, Math.min(buffer.byteLength, 1024)).indexOf('%PDF-')
-    const trailer = buffer.subarray(Math.max(0, buffer.byteLength - 1024)).indexOf('%%EOF')
-    return buffer.byteLength >= 14 && header >= 0 && trailer >= 0
+  if (buffer.byteLength < 32) return false
+  const headerSearch = buffer.subarray(0, Math.min(buffer.byteLength, 1_024)).toString('latin1')
+  const header = headerSearch.match(/%PDF-(?:1\.[0-7]|2\.0)/u)
+  if (!header || header.index === undefined) return false
+  const tail = buffer.subarray(Math.max(0, buffer.byteLength - 2_048)).toString('latin1')
+  const eof = /%%EOF[\x00\x09\x0A\x0C\x0D\x20]*$/u.exec(tail)
+  if (!eof) return false
+  const body = buffer.toString('latin1', header.index, buffer.byteLength - tail.length + (eof.index ?? 0))
+  const objects = body.match(/(?:^|[\r\n])\s*\d+\s+\d+\s+obj(?:\s|$)/gu)?.length ?? 0
+  const ends = body.match(/(?:^|[\r\n])\s*endobj(?:\s|$)/gu)?.length ?? 0
+  if (objects === 0 || objects !== ends) return false
+  const startXref = /startxref\s+(\d+)\s*$/u.exec(body)
+  if (!startXref) return false
+  const xrefOffset = Number(startXref[1])
+  if (!Number.isSafeInteger(xrefOffset) || xrefOffset < header.index || xrefOffset >= buffer.byteLength) return false
+  const xrefTarget = buffer.subarray(xrefOffset, Math.min(buffer.byteLength, xrefOffset + 32)).toString('latin1')
+  return /^xref(?:\s|$)/u.test(xrefTarget) || /^\d+\s+\d+\s+obj(?:\s|$)/u.test(xrefTarget)
+}
+
+function jpegMarkerHasLength(marker: number): boolean {
+  return marker !== 0x01 && marker !== 0xd8 && marker !== 0xd9 && (marker < 0xd0 || marker > 0xd7)
+}
+
+function isJpeg(bytes: Uint8Array): boolean {
+  if (bytes.length < 16 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return false
+  let offset = 2
+  let sawFrame = false
+  let sawScan = false
+  let sawQuantizationTable = false
+  let sawHuffmanTable = false
+  while (offset < bytes.length) {
+    if (bytes[offset] !== 0xff) return false
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1
+    if (offset >= bytes.length) return false
+    const marker = bytes[offset++]!
+    if (marker === 0x00) return false
+    if (marker === 0xd9) {
+      return offset === bytes.length && sawFrame && sawScan && sawQuantizationTable && sawHuffmanTable
+    }
+    if (!jpegMarkerHasLength(marker)) continue
+    if (offset + 2 > bytes.length) return false
+    const length = (bytes[offset]! << 8) | bytes[offset + 1]!
+    if (length < 2 || offset + length > bytes.length) return false
+    const payloadOffset = offset + 2
+    const payloadLength = length - 2
+    if (marker === 0xdb) {
+      if (payloadLength < 65) return false
+      sawQuantizationTable = true
+    }
+    if (marker === 0xc4) {
+      if (payloadLength < 18) return false
+      sawHuffmanTable = true
+    }
+    if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) || marker === 0xc9) {
+      if (
+        payloadLength < 6 ||
+        (bytes[payloadOffset + 1] === 0 && bytes[payloadOffset + 2] === 0) ||
+        (bytes[payloadOffset + 3] === 0 && bytes[payloadOffset + 4] === 0)
+      ) {
+        return false
+      }
+      sawFrame = true
+    }
+    offset += length
+    if (marker !== 0xda) continue
+    if (!sawFrame || payloadLength < 6) return false
+    sawScan = true
+    while (offset < bytes.length) {
+      if (bytes[offset] !== 0xff) {
+        offset += 1
+        continue
+      }
+      let markerOffset = offset + 1
+      while (markerOffset < bytes.length && bytes[markerOffset] === 0xff) markerOffset += 1
+      if (markerOffset >= bytes.length) return false
+      const entropyMarker = bytes[markerOffset]!
+      if (entropyMarker === 0x00 || (entropyMarker >= 0xd0 && entropyMarker <= 0xd7)) {
+        offset = markerOffset + 1
+        continue
+      }
+      offset = markerOffset - 1
+      break
+    }
   }
-  if (mediaType === 'image/jpeg') {
-    return (
-      buffer.byteLength >= 8 &&
-      buffer[0] === 0xff &&
-      buffer[1] === 0xd8 &&
-      buffer[2] === 0xff &&
-      buffer.at(-2) === 0xff &&
-      buffer.at(-1) === 0xd9
-    )
+  return false
+}
+
+let crcTable: Uint32Array | undefined
+
+function pngCrc(bytes: Uint8Array): number {
+  crcTable ??= Uint32Array.from({ length: 256 }, (_, value) => {
+    let crc = value
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) !== 0 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1
+    return crc >>> 0
+  })
+  let crc = 0xffffffff
+  for (const byte of bytes) crc = crcTable[(crc ^ byte) & 0xff]! ^ (crc >>> 8)
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function pngInflatedBytes(
+  width: number,
+  height: number,
+  bitDepth: number,
+  colorType: number,
+  interlace: number,
+): number | null {
+  const channels = colorType === 0 || colorType === 3 ? 1 : colorType === 2 ? 3 : colorType === 4 ? 2 : 4
+  const bitsPerPixel = channels * bitDepth
+  const passSize = (startX: number, startY: number, stepX: number, stepY: number): number | null => {
+    if (width <= startX || height <= startY) return 0
+    const passWidth = Math.ceil((width - startX) / stepX)
+    const passHeight = Math.ceil((height - startY) / stepY)
+    const rowBytes = Math.ceil((passWidth * bitsPerPixel) / 8) + 1
+    const bytes = rowBytes * passHeight
+    return Number.isSafeInteger(bytes) ? bytes : null
   }
+  const passes: ReadonlyArray<readonly [number, number, number, number]> =
+    interlace === 0
+      ? [[0, 0, 1, 1] as const]
+      : [
+          [0, 0, 8, 8] as const,
+          [4, 0, 8, 8] as const,
+          [0, 4, 4, 8] as const,
+          [2, 0, 4, 4] as const,
+          [0, 2, 2, 4] as const,
+          [1, 0, 2, 2] as const,
+          [0, 1, 1, 2] as const,
+        ]
+  let total = 0
+  for (const pass of passes) {
+    const bytes = passSize(...pass)
+    if (bytes === null || !Number.isSafeInteger(total + bytes)) return null
+    total += bytes
+  }
+  return total
+}
+
+function isPng(bytes: Uint8Array): boolean {
   const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
-  const ihdr = [0x49, 0x48, 0x44, 0x52]
-  const iend = [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]
-  return (
-    buffer.byteLength >= 45 &&
-    signature.every((value, index) => buffer[index] === value) &&
-    ihdr.every((value, index) => buffer[index + 12] === value) &&
-    iend.every((value, index) => buffer[buffer.byteLength - iend.length + index] === value)
-  )
+  if (bytes.length < 57 || !signature.every((value, index) => bytes[index] === value)) return false
+  let offset = signature.length
+  let chunkIndex = 0
+  let width = 0
+  let height = 0
+  let bitDepth = 0
+  let colorType = 0
+  let interlace = 0
+  let sawPalette = false
+  let sawData = false
+  const imageData: Uint8Array[] = []
+  while (offset < bytes.length) {
+    if (offset + 12 > bytes.length) return false
+    const length =
+      bytes[offset]! * 0x1000000 + bytes[offset + 1]! * 0x10000 + bytes[offset + 2]! * 0x100 + bytes[offset + 3]!
+    if (!Number.isSafeInteger(length) || length < 0 || offset + 12 + length > bytes.length) return false
+    const typeOffset = offset + 4
+    const dataOffset = offset + 8
+    const crcOffset = dataOffset + length
+    const type = Buffer.from(bytes.subarray(typeOffset, dataOffset)).toString('ascii')
+    if (!/^[A-Za-z]{4}$/u.test(type)) return false
+    const expectedCrc =
+      bytes[crcOffset]! * 0x1000000 +
+      bytes[crcOffset + 1]! * 0x10000 +
+      bytes[crcOffset + 2]! * 0x100 +
+      bytes[crcOffset + 3]!
+    if (pngCrc(bytes.subarray(typeOffset, crcOffset)) !== expectedCrc >>> 0) return false
+    const data = bytes.subarray(dataOffset, crcOffset)
+    if (chunkIndex === 0) {
+      if (type !== 'IHDR' || length !== 13) return false
+      width = data[0]! * 0x1000000 + data[1]! * 0x10000 + data[2]! * 0x100 + data[3]!
+      height = data[4]! * 0x1000000 + data[5]! * 0x10000 + data[6]! * 0x100 + data[7]!
+      bitDepth = data[8]!
+      colorType = data[9]!
+      interlace = data[12]!
+      const validDepths: Record<number, readonly number[]> = {
+        0: [1, 2, 4, 8, 16],
+        2: [8, 16],
+        3: [1, 2, 4, 8],
+        4: [8, 16],
+        6: [8, 16],
+      }
+      if (
+        width <= 0 ||
+        height <= 0 ||
+        !validDepths[colorType]?.includes(bitDepth) ||
+        data[10] !== 0 ||
+        data[11] !== 0 ||
+        (interlace !== 0 && interlace !== 1)
+      ) {
+        return false
+      }
+    } else if (type === 'IHDR') {
+      return false
+    }
+    if (type === 'PLTE') {
+      if (sawData || length === 0 || length % 3 !== 0 || length > 768) return false
+      sawPalette = true
+    }
+    if (type === 'IDAT') {
+      if (colorType === 3 && !sawPalette) return false
+      sawData = true
+      imageData.push(data)
+    }
+    offset = crcOffset + 4
+    chunkIndex += 1
+    if (type !== 'IEND') continue
+    if (length !== 0 || !sawData || offset !== bytes.length) return false
+    const inflatedBytes = pngInflatedBytes(width, height, bitDepth, colorType, interlace)
+    if (inflatedBytes === null || inflatedBytes === 0 || inflatedBytes > MAX_PNG_INFLATED_BYTES) return false
+    try {
+      const inflated = inflateSync(Buffer.concat(imageData.map((part) => Buffer.from(part))), {
+        maxOutputLength: inflatedBytes,
+      })
+      return inflated.byteLength === inflatedBytes
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
+export function attachmentMatchesMediaType(bytes: Uint8Array, mediaType: RaftAttachmentMediaType): boolean {
+  if (mediaType === 'application/pdf') return isPdf(bytes)
+  if (mediaType === 'image/jpeg') return isJpeg(bytes)
+  return isPng(bytes)
 }
 
 function parseAttachment(value: unknown): RaftAttachment | null {
@@ -229,6 +433,10 @@ export function stripAgentMention(content: string, agentName: string): { mention
   const mention = new RegExp(`(^|\\s)@${escaped}(?=\\s|[,:;.!?]|$)`, 'iu')
   if (!mention.test(content)) return { mentioned: false, content }
   return { mentioned: true, content: content.replace(mention, '$1').trim() }
+}
+
+export function stripRaftTransportMarkers(content: string): string {
+  return content.replace(/<!-- eve-raft-event:[a-f0-9]{64} -->\r?\n?/gu, '').trim()
 }
 
 export function taskFor(message: RaftMessage): { channel: string; number: number } | null {

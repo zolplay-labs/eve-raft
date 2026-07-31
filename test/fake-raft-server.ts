@@ -45,8 +45,10 @@ export class FakeRaftServer {
   readonly messages = new Map<string, Record<string, unknown>>()
   readonly tasks: TaskRecord[] = []
   readonly taskClaims: Array<{ channel: string; taskNumber: number; operation: 'claim' | 'unclaim' }> = []
+  failNextTaskClaimAfterAccept = false
   deviceApproved = false
   nextSendFailure: { status: number; body: Record<string, unknown> } | null = null
+  private readonly taskMutationResults = new Map<string, Record<string, unknown>>()
   private server: Server | null = null
   origin = ''
 
@@ -247,14 +249,33 @@ export class FakeRaftServer {
     }
     if (request.method === 'POST' && path === '/tasks/claim') {
       const body = await jsonBody(request)
+      const idempotencyKey = String(body.idempotencyKey ?? '')
+      const replay = this.taskMutationResults.get(idempotencyKey)
+      if (idempotencyKey && replay) {
+        json(response, 200, replay)
+        return
+      }
       const channel = String(body.channel ?? '')
       const taskNumber = Number((body.task_numbers as unknown[])?.[0])
       this.taskClaims.push({ channel, taskNumber, operation: 'claim' })
-      json(response, 200, { results: [{ success: true }] })
+      const result = { results: [{ success: true }] }
+      if (idempotencyKey) this.taskMutationResults.set(idempotencyKey, result)
+      if (this.failNextTaskClaimAfterAccept) {
+        this.failNextTaskClaimAfterAccept = false
+        json(response, 503, { error: 'response_lost_after_task_claim' })
+        return
+      }
+      json(response, 200, result)
       return
     }
     if (request.method === 'POST' && path === '/tasks/unclaim') {
       const body = await jsonBody(request)
+      const idempotencyKey = String(body.idempotencyKey ?? '')
+      const replay = this.taskMutationResults.get(idempotencyKey)
+      if (idempotencyKey && replay) {
+        json(response, 200, replay)
+        return
+      }
       const task = this.tasks.find(
         (candidate) => candidate.channel === body.channel && candidate.taskNumber === body.task_number,
       )
@@ -264,11 +285,19 @@ export class FakeRaftServer {
         taskNumber: Number(body.task_number),
         operation: 'unclaim',
       })
-      json(response, 200, { success: true })
+      const result = { success: true }
+      if (idempotencyKey) this.taskMutationResults.set(idempotencyKey, result)
+      json(response, 200, result)
       return
     }
     if (request.method === 'POST' && path === '/tasks/update-status') {
       const body = await jsonBody(request)
+      const idempotencyKey = String(body.idempotencyKey ?? '')
+      const replay = this.taskMutationResults.get(idempotencyKey)
+      if (idempotencyKey && replay) {
+        json(response, 200, replay)
+        return
+      }
       const task = this.tasks.find(
         (candidate) => candidate.channel === body.channel && candidate.taskNumber === body.task_number,
       )
@@ -277,7 +306,9 @@ export class FakeRaftServer {
         return
       }
       task.status = String(body.status)
-      json(response, 200, { ok: true })
+      const result = { ok: true }
+      if (idempotencyKey) this.taskMutationResults.set(idempotencyKey, result)
+      json(response, 200, result)
       return
     }
     json(response, 404, { error: 'not_found' })

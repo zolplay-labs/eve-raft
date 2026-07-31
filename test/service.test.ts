@@ -109,14 +109,44 @@ describe('Eve Raft service', () => {
         task_assignee_type: 'agent',
       }),
     )
+    let statusAtEveInvocation: string | undefined
+    eve.onInput = () => {
+      statusAtEveInvocation = raft.tasks[0]?.status
+    }
     const instance = await service()
 
     await instance.drain()
     await instance.processNext()
 
     expect(raft.taskClaims).toContainEqual({ channel: '#tasks', taskNumber: 7, operation: 'claim' })
+    expect(statusAtEveInvocation).toBe('in_progress')
     expect(raft.tasks[0]?.status).toBe('in_review')
     expect(raft.sent[0]).toMatchObject({ target: '#tasks:task-7', content: 'Echo: Ship it' })
+  })
+
+  it('does not claim or invoke a task assigned to another agent', async () => {
+    raft.addTask({ channel: '#tasks', taskNumber: 8, title: 'Not ours', status: 'todo', messageId: 'task-8' })
+    raft.events.push(
+      message({
+        id: 'task-8',
+        message_id: 'task-8',
+        channel_type: 'channel',
+        channel_name: 'tasks',
+        content: 'Not ours',
+        task_number: 8,
+        task_status: 'todo',
+        task_assignee_id: 'agent-other',
+        task_assignee_type: 'agent',
+      }),
+    )
+    const instance = await service()
+
+    await instance.drain()
+    await instance.processNext()
+
+    expect(eve.inputs).toHaveLength(0)
+    expect(raft.taskClaims).toHaveLength(0)
+    expect(raft.tasks[0]?.status).toBe('todo')
   })
 
   it('persists numbered human input and resumes it from the same thread', async () => {
@@ -247,7 +277,7 @@ describe('Eve Raft service', () => {
     )
     await instance.drain()
     await instance.processNext()
-    expect(eve.inputs.at(-1)?.input).toBe('2')
+    expect(eve.inputs.at(-1)?.input).toMatch(/^<!-- eve-raft-event:[a-f0-9]{64} -->\n2$/u)
     expect((await new StateStore(stateDirectory).loadPendingInput()).byReplyTarget).not.toEqual({})
 
     const answer = message({
@@ -280,8 +310,9 @@ describe('Eve Raft service', () => {
     expect(instance.health.queueDepth).toBe(1_000)
     expect(raft.eventPolls).toBe(1)
 
-    await instance.processNext()
-    await instance.drain()
+    const restarted = await service()
+    await restarted.processNext()
+    await restarted.drain()
 
     expect(raft.eventPolls).toBe(1)
     expect((await new StateStore(stateDirectory).loadQueue()).events.at(-1)?.id).toBe('message-1001')
@@ -348,6 +379,8 @@ describe('Eve Raft service', () => {
         channel_name: 'tasks',
         content: 'Ship it',
         task_number: 8,
+        task_assignee_id: raft.agentId,
+        task_assignee_type: 'agent',
       }),
     )
     eve.emptyNextResult = true

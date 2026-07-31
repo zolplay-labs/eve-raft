@@ -111,6 +111,8 @@ describe('retry and restart recovery', () => {
       channel_name: 'tasks',
       content: 'ship it',
       task_number: 7,
+      task_assignee_id: raft.agentId,
+      task_assignee_type: 'agent',
     }
     const newer = { ...message(), id: 'message-2', message_id: 'message-2', seq: 2, content: 'newer' }
     raft.addTask({ channel: '#tasks', taskNumber: 7, title: 'Ship it', status: 'todo', messageId: 'task-7' })
@@ -163,6 +165,8 @@ describe('retry and restart recovery', () => {
         channel_name: 'tasks',
         content: 'Ship it',
         task_number: 7,
+        task_assignee_id: raft.agentId,
+        task_assignee_type: 'agent',
       },
       { ...message(), id: 'message-2', message_id: 'message-2', seq: 2 },
     )
@@ -176,5 +180,50 @@ describe('retry and restart recovery', () => {
     expect(raft.taskClaims).toContainEqual({ channel: '#tasks', taskNumber: 7, operation: 'unclaim' })
     expect(raft.sent).toHaveLength(1)
     expect(service.health.queueDepth).toBe(0)
+  })
+
+  it('does not dispatch the same Eve turn again when the acceptance response is lost', async () => {
+    raft.events.push(message())
+    const first = await createService()
+    await first.drain()
+    eve.failNextDispatchAfterAccept = true
+
+    await expect(first.processNext()).rejects.toThrow('Eve returned HTTP 503')
+    expect(eve.inputs).toHaveLength(1)
+
+    const restarted = await createService()
+    await restarted.processNext()
+
+    expect(eve.inputs).toHaveLength(1)
+    expect(raft.sent).toHaveLength(1)
+    expect(restarted.health.queueDepth).toBe(0)
+  })
+
+  it('does not duplicate a task claim when its acceptance response is lost', async () => {
+    raft.addTask({ channel: '#tasks', taskNumber: 7, title: 'Ship it', status: 'todo', messageId: 'task-7' })
+    raft.events.push({
+      ...message(),
+      id: 'task-7',
+      message_id: 'task-7',
+      channel_type: 'channel',
+      channel_name: 'tasks',
+      content: 'Ship it',
+      task_number: 7,
+      task_assignee_id: raft.agentId,
+      task_assignee_type: 'agent',
+    })
+    const first = await createService()
+    await first.drain()
+    raft.failNextTaskClaimAfterAccept = true
+
+    await expect(first.processNext()).rejects.toThrow('response_lost_after_task_claim')
+    expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
+
+    const restarted = await createService()
+    await restarted.processNext()
+
+    expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
+    expect(raft.tasks[0]?.status).toBe('in_review')
+    expect(restarted.health.queueDepth).toBe(0)
   })
 })

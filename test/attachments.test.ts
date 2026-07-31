@@ -14,6 +14,18 @@ const PNG_BYTES = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
 )
+const JPEG_BYTES = Buffer.from(
+  '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==',
+  'base64',
+)
+
+function pdfBytes(): Uint8Array {
+  const prefix = '%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n'
+  const xrefOffset = Buffer.byteLength(prefix)
+  return new TextEncoder().encode(
+    `${prefix}xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Root 1 0 R /Size 2 >>\nstartxref\n${xrefOffset}\n%%EOF\n`,
+  )
+}
 
 describe('Raft attachments', () => {
   let raft: FakeRaftServer
@@ -71,15 +83,15 @@ describe('Raft attachments', () => {
 
     const input = eve.inputs[0]?.input as Array<Record<string, unknown>>
     expect(input).toEqual([
-      { type: 'text', text: 'review this' },
+      { type: 'text', text: expect.stringMatching(/^<!-- eve-raft-event:[a-f0-9]{64} -->\nreview this$/u) },
       expect.objectContaining({ type: 'file', mediaType: 'image/png', filename: 'brief.png' }),
     ])
     expect(Buffer.isBuffer(input[1]?.data)).toBe(true)
   })
 
   it.each([
-    ['application/pdf', 'brief.pdf', new TextEncoder().encode('%PDF-1.7\n1 0 obj\nendobj\n%%EOF')],
-    ['image/jpeg', 'brief.jpg', Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0xff, 0xd9])],
+    ['application/pdf', 'brief.pdf', pdfBytes()],
+    ['image/jpeg', 'brief.jpg', JPEG_BYTES],
   ] as const)('verifies and transfers %s bytes', async (mediaType, filename, bytes) => {
     raft.attachments.set('attachment-supported', { bytes, mediaType: 'application/octet-stream' })
     raft.events.push({

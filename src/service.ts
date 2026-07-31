@@ -247,13 +247,6 @@ class EveResponseError extends Error {
   }
 }
 
-class CompatibilityError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'CompatibilityError'
-  }
-}
-
 function isRaftAuthenticationFailure(error: unknown): error is HttpResponseError {
   return error instanceof HttpResponseError && (error.status === 401 || error.status === 403)
 }
@@ -382,12 +375,6 @@ export class EveRaftService {
         if (isRaftAuthenticationFailure(error)) {
           this.disconnect('credential_rejected')
           failures = 0
-          await delay(EVENT_POLL_MS, signal)
-          continue
-        }
-        if (error instanceof CompatibilityError) {
-          this.health.state = 'error'
-          this.health.lastError = 'unsupported_protocol'
           await delay(EVENT_POLL_MS, signal)
           continue
         }
@@ -540,9 +527,6 @@ export class EveRaftService {
       server.runtimeContext.serverId !== credential.serverId
     ) {
       throw new Error('Stored Raft credential does not match the configured agent and server')
-    }
-    if (server.protocolVersion !== RAFT_CHANNEL_PROTOCOL_VERSION) {
-      throw new CompatibilityError(`Unsupported Raft protocol version ${String(server.protocolVersion)}`)
     }
     this.credential = credential
     this.raft = raft

@@ -32,7 +32,8 @@ export class FakeRaftServer {
   readonly agentName = 'Dex'
   readonly serverId = 'server-1'
   apiKey = 'raft-api-key'
-  protocolVersion: number | undefined = 1
+  runtimeAgentId: string | undefined = this.agentId
+  runtimeServerId: string | undefined = this.serverId
   eventPolls = 0
   readonly events: Record<string, unknown>[] = []
   readonly sent: SentMessage[] = []
@@ -159,8 +160,7 @@ export class FakeRaftServer {
     }
     if (request.method === 'GET' && path === '/server') {
       json(response, 200, {
-        ...(this.protocolVersion === undefined ? {} : { protocolVersion: this.protocolVersion }),
-        runtimeContext: { agentId: this.agentId, serverId: this.serverId },
+        runtimeContext: { agentId: this.runtimeAgentId, serverId: this.runtimeServerId },
         channels: [
           ...new Set(
             this.tasks.filter((task) => task.channel.startsWith('#')).map((task) => ({ name: task.channel.slice(1) })),

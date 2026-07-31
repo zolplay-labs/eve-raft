@@ -76,6 +76,9 @@ export async function connectRaft(
   if (!token) throw new Error('Raft device authorization expired before it was approved')
 
   const minted = await mintRaftCredential(serverUrl, options.agentId, token.accessToken)
+  if (!minted.apiKey || !minted.agentId || !minted.agentName || !minted.serverId || !minted.credentialId) {
+    throw new Error('Raft credential response is incomplete')
+  }
   const credential: RaftCredential = {
     schemaVersion: 1,
     serverUrl,
@@ -83,7 +86,7 @@ export async function connectRaft(
     agentName: minted.agentName,
     serverId: minted.serverId,
     credentialId: minted.credentialId,
-    scopes: minted.scopes ?? [],
+    scopes: Array.isArray(minted.scopes) ? minted.scopes : [],
     apiKey: minted.apiKey,
     createdAt: new Date(runtime.now()).toISOString(),
   }
@@ -99,10 +102,6 @@ export async function connectRaft(
   ) {
     throw new Error('Raft credential validation did not match the requested external agent')
   }
-  if (server.protocolVersion !== RAFT_CHANNEL_PROTOCOL_VERSION) {
-    throw new Error(`Unsupported Raft protocol version ${String(server.protocolVersion)}`)
-  }
-
   await store.saveCredential(credential)
   runtime.log(`Connected @${credential.agentName}; credential saved in ${store.directory}`)
   return {

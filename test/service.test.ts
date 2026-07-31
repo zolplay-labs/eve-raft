@@ -359,15 +359,21 @@ describe('Eve Raft service', () => {
     }
   }, 10_000)
 
-  it.each([undefined, 2])('rejects a stored Raft protocol version %s', async (protocolVersion) => {
-    raft.protocolVersion = protocolVersion
-    const instance = new EveRaftService({
-      stateDirectory,
-      eveOrigin: eve.origin,
-      channelToken: 'channel-secret',
-    })
-    await expect(instance.initialize()).rejects.toThrow(`Unsupported Raft protocol version ${String(protocolVersion)}`)
-  })
+  it.each(['agent', 'server'] as const)(
+    'rejects a stored credential with a missing Raft %s identity',
+    async (identity) => {
+      if (identity === 'agent') raft.runtimeAgentId = undefined
+      else raft.runtimeServerId = undefined
+      const instance = new EveRaftService({
+        stateDirectory,
+        eveOrigin: eve.origin,
+        channelToken: 'channel-secret',
+      })
+      await expect(instance.initialize()).rejects.toThrow(
+        'Stored Raft credential does not match the configured agent and server',
+      )
+    },
+  )
 
   it('does not advance a task without a delivered result', async () => {
     raft.addTask({ channel: '#tasks', taskNumber: 8, title: 'Ship it', status: 'todo', messageId: 'task-8' })

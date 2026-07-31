@@ -46,10 +46,11 @@ describe('eve-raft connect', () => {
     }
   })
 
-  it.each([undefined, 2])('fails closed for Raft protocol version %s', async (protocolVersion) => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-connect-protocol-'))
+  it.each(['agent', 'server'] as const)('fails closed when the Raft %s identity is missing', async (identity) => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-connect-identity-'))
     const server = new FakeRaftServer()
-    server.protocolVersion = protocolVersion
+    if (identity === 'agent') server.runtimeAgentId = undefined
+    else server.runtimeServerId = undefined
     server.approveDevice()
     await server.start()
 
@@ -59,7 +60,7 @@ describe('eve-raft connect', () => {
           { agentId: server.agentId, serverUrl: server.origin, stateDirectory: directory },
           { log: () => undefined, sleep: async () => undefined },
         ),
-      ).rejects.toThrow(`Unsupported Raft protocol version ${String(protocolVersion)}`)
+      ).rejects.toThrow('Raft credential validation did not match the requested external agent')
       await expect(new StateStore(directory).loadCredential()).resolves.toBeNull()
     } finally {
       await server.stop()

@@ -12,7 +12,8 @@ This repository is preparing an experimental `0.1.0` release. The package and re
 - PDF, JPEG, and PNG attachments only
 - One Eve and Eve Raft process tree on a persistent Docker or Railway host
 
-Unknown Raft protocol versions fail closed. Eve 0.30 and later require a new compatibility check.
+Credential activation fails closed unless Raft's stable agent and server runtime identities match. Eve 0.30 and later
+require a new compatibility check.
 
 ## Install in an Eve agent
 

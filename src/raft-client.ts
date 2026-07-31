@@ -69,7 +69,6 @@ export interface RaftProfile {
 }
 
 export interface RaftServerInfo {
-  protocolVersion?: number
   runtimeContext?: { agentId?: string; serverId?: string }
   channels?: Array<{ name?: unknown }>
   humans?: Array<{ name?: unknown }>

@@ -216,6 +216,46 @@ describe('Eve Raft service', () => {
     expect(raft.sent).not.toContainEqual(expect.objectContaining({ content: 'Echo: 2' }))
   })
 
+  it('does not redeliver a resumed result when the canonical answer follows its wake event', async () => {
+    const instance = await service()
+    raft.events.push(message({ id: 'rootabcd-1111', message_id: 'rootabcd-1111', content: 'ask me first' }))
+    await instance.drain()
+    await instance.processNext()
+    const sentBeforeAnswer = raft.sent.length
+
+    const answer = message({
+      seq: 2,
+      id: 'answerxy-2222',
+      message_id: 'answerxy-2222',
+      channel_type: 'thread',
+      channel_name: 'rootabcd',
+      parent_channel_type: 'dm',
+      parent_channel_name: 'Dex',
+      content: '2',
+    })
+    raft.messages.set('wake-root-3333', answer)
+    raft.events.push(
+      message({
+        seq: 2,
+        id: 'wake-root-3333',
+        message_id: 'wake-root-3333',
+        channel_type: 'dm',
+        channel_name: 'Dex',
+        content: '2',
+      }),
+    )
+    await instance.drain()
+    await instance.processNext()
+
+    const restarted = await service()
+    raft.events.push(answer)
+    expect(await restarted.drain()).toBe(0)
+    expect(await restarted.processNext()).toBe(false)
+
+    expect(eve.inputs.filter((entry) => !Array.isArray(entry.input) && typeof entry.input === 'object')).toHaveLength(1)
+    expect(raft.sent.slice(sentBeforeAnswer).map((sent) => sent.content)).toEqual(['Resumed: two'])
+  })
+
   it('keeps pending input across a restart and guides an invalid answer', async () => {
     const first = await service()
     raft.events.push(message({ content: 'ask me first' }))

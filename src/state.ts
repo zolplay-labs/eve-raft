@@ -40,6 +40,7 @@ export interface PendingInputRequest {
 
 export interface QueuedRaftEvent {
   id: string
+  canonicalId?: string
   receivedAt: string
   message: RawRaftMessage
   taskPhase?: 'started' | 'delivered' | 'reviewed'
@@ -60,6 +61,7 @@ export interface QueuedRaftEvent {
 export interface QueueFile {
   schemaVersion: 1
   events: QueuedRaftEvent[]
+  recentEventIds: string[]
 }
 
 export interface PendingInputFile {
@@ -74,6 +76,7 @@ export interface PendingEventsFile {
 
 const MAX_QUEUE_EVENTS = 1_000
 const MAX_QUEUE_BYTES = 16 * 1024 * 1024
+const MAX_RECENT_EVENT_IDS = 4_096
 const MAX_PENDING_TARGETS = 1_000
 const MAX_PENDING_REQUESTS_PER_TARGET = 100
 const MAX_PENDING_OPTIONS_PER_REQUEST = 100
@@ -161,6 +164,14 @@ function validateQueue(value: unknown): QueueFile {
   if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.events)) {
     throw new Error('Durable Raft queue is invalid')
   }
+  const recentEventIds = value.recentEventIds ?? []
+  if (
+    !Array.isArray(recentEventIds) ||
+    recentEventIds.length > MAX_RECENT_EVENT_IDS ||
+    !recentEventIds.every((id) => boundedString(id, 200))
+  ) {
+    throw new Error('Durable Raft recent-event ledger is invalid')
+  }
   const events: QueuedRaftEvent[] = []
   for (const valueEvent of value.events) {
     if (
@@ -179,6 +190,9 @@ function validateQueue(value: unknown): QueueFile {
       valueEvent.taskPhase !== 'reviewed'
     ) {
       throw new Error('Durable Raft task checkpoint is invalid')
+    }
+    if (valueEvent.canonicalId !== undefined && !boundedString(valueEvent.canonicalId, 200)) {
+      throw new Error('Durable Raft canonical event checkpoint is invalid')
     }
     if (valueEvent.freshnessDeferred !== undefined && valueEvent.freshnessDeferred !== true) {
       throw new Error('Durable Raft freshness checkpoint is invalid')
@@ -201,7 +215,7 @@ function validateQueue(value: unknown): QueueFile {
     events.push(valueEvent as unknown as QueuedRaftEvent)
   }
   if (events.length > MAX_QUEUE_EVENTS) throw new Error('Durable Raft queue has too many events')
-  return { schemaVersion: 1, events }
+  return { schemaVersion: 1, events, recentEventIds }
 }
 
 export class StateStore {
@@ -276,7 +290,7 @@ export class StateStore {
 
   async loadQueue(): Promise<QueueFile> {
     const value = await readJson(this.queuePath)
-    return value === null ? { schemaVersion: 1, events: [] } : validateQueue(value)
+    return value === null ? { schemaVersion: 1, events: [], recentEventIds: [] } : validateQueue(value)
   }
 
   async loadPendingEvents(): Promise<PendingEventsFile> {
@@ -309,7 +323,10 @@ export class StateStore {
     queue: QueueFile,
     messages: RawRaftMessage[],
   ): Promise<{ added: number; consumed: number; dropped: string[] }> {
-    const known = new Set(queue.events.map((event) => event.id))
+    const known = new Set([
+      ...queue.recentEventIds,
+      ...queue.events.flatMap((event) => [event.id, ...(event.canonicalId ? [event.canonicalId] : [])]),
+    ])
     const additions: QueuedRaftEvent[] = []
     const dropped: string[] = []
     let consumed = 0
@@ -320,7 +337,7 @@ export class StateStore {
         continue
       }
       const candidate: QueuedRaftEvent = { id, receivedAt: new Date().toISOString(), message }
-      const isolated = { schemaVersion: 1 as const, events: [candidate] }
+      const isolated = { schemaVersion: 1 as const, events: [candidate], recentEventIds: [] }
       if (Buffer.byteLength(JSON.stringify(isolated)) > MAX_QUEUE_BYTES) {
         dropped.push(id)
         known.add(id)
@@ -328,7 +345,11 @@ export class StateStore {
         continue
       }
       if (queue.events.length + additions.length >= MAX_QUEUE_EVENTS) break
-      const next = { schemaVersion: 1 as const, events: [...queue.events, ...additions, candidate] }
+      const next = {
+        schemaVersion: 1 as const,
+        events: [...queue.events, ...additions, candidate],
+        recentEventIds: queue.recentEventIds,
+      }
       if (Buffer.byteLength(JSON.stringify(next)) > MAX_QUEUE_BYTES) break
       additions.push(candidate)
       known.add(id)
@@ -347,20 +368,40 @@ export class StateStore {
     patch: Partial<
       Pick<
         QueuedRaftEvent,
-        'taskPhase' | 'taskAnchor' | 'freshnessSeenUpToSeq' | 'freshnessDeferred' | 'dispatch' | 'replyDelivered'
+        | 'canonicalId'
+        | 'taskPhase'
+        | 'taskAnchor'
+        | 'freshnessSeenUpToSeq'
+        | 'freshnessDeferred'
+        | 'dispatch'
+        | 'replyDelivered'
       >
     >,
   ): Promise<void> {
     const head = queue.events[0]
     if (!head || head.id !== eventId) throw new Error(`Raft queue head changed before checkpointing ${eventId}`)
-    queue.events = [{ ...head, ...patch }, ...queue.events.slice(1)]
+    const checkpointed = { ...head, ...patch }
+    const aliases = new Set([checkpointed.id, ...(checkpointed.canonicalId ? [checkpointed.canonicalId] : [])])
+    queue.events = [
+      checkpointed,
+      ...queue.events
+        .slice(1)
+        .filter((event) => !aliases.has(event.id) && (!event.canonicalId || !aliases.has(event.canonicalId))),
+    ]
     await writeJsonAtomic(this.queuePath, queue)
   }
 
   async shiftEvent(queue: QueueFile, eventId: string): Promise<void> {
     const head = queue.events[0]
     if (!head || head.id !== eventId) throw new Error(`Raft queue head changed before shifting ${eventId}`)
-    queue.events = queue.events.slice(1)
+    const completed = [head.id, ...(head.canonicalId ? [head.canonicalId] : [])]
+    const completedSet = new Set(completed)
+    queue.events = queue.events
+      .slice(1)
+      .filter((event) => !completedSet.has(event.id) && (!event.canonicalId || !completedSet.has(event.canonicalId)))
+    queue.recentEventIds = [...queue.recentEventIds.filter((id) => !completedSet.has(id)), ...completed].slice(
+      -MAX_RECENT_EVENT_IDS,
+    )
     await writeJsonAtomic(this.queuePath, queue)
   }
 
@@ -376,7 +417,10 @@ export class StateStore {
       throw new Error(`Invalid Raft freshness cursor for ${eventId}`)
     }
     const rest = queue.events.slice(1)
-    const known = new Set(queue.events.map((event) => event.id))
+    const known = new Set([
+      ...queue.recentEventIds,
+      ...queue.events.flatMap((event) => [event.id, ...(event.canonicalId ? [event.canonicalId] : [])]),
+    ])
     const additions: QueuedRaftEvent[] = []
     let consumed = 0
     for (const message of messages) {
@@ -387,7 +431,11 @@ export class StateStore {
       }
       if (rest.length + additions.length + 1 >= MAX_QUEUE_EVENTS) break
       const addition: QueuedRaftEvent = { id, receivedAt: new Date().toISOString(), message }
-      const candidate = { schemaVersion: 1 as const, events: [...rest, ...additions, addition, head] }
+      const candidate = {
+        schemaVersion: 1 as const,
+        events: [...rest, ...additions, addition, head],
+        recentEventIds: queue.recentEventIds,
+      }
       if (Buffer.byteLength(JSON.stringify(candidate)) > MAX_QUEUE_BYTES) break
       additions.push(addition)
       known.add(id)
@@ -415,25 +463,39 @@ export class StateStore {
   ): Promise<{ added: number; consumed: number }> {
     const head = queue.events[0]
     if (!head || head.id !== eventId) throw new Error(`Raft queue head changed before advancing ${eventId}`)
-    const rest = queue.events.slice(1)
-    const known = new Set(rest.map((event) => event.id))
+    const headAliases = new Set([head.id, ...(head.canonicalId ? [head.canonicalId] : [])])
+    const rest = queue.events
+      .slice(1)
+      .filter((event) => !headAliases.has(event.id) && (!event.canonicalId || !headAliases.has(event.canonicalId)))
+    const recentEventIds = [...queue.recentEventIds.filter((id) => !headAliases.has(id)), ...headAliases].slice(
+      -MAX_RECENT_EVENT_IDS,
+    )
+    const known = new Set([
+      ...recentEventIds,
+      ...rest.flatMap((event) => [event.id, ...(event.canonicalId ? [event.canonicalId] : [])]),
+    ])
     const additions: QueuedRaftEvent[] = []
     let consumed = 0
     for (const message of messages) {
       const id = messageId(message)
-      if (!id || id === eventId || known.has(id)) {
+      if (!id || known.has(id)) {
         consumed += 1
         continue
       }
       if (rest.length + additions.length >= MAX_QUEUE_EVENTS) break
       const addition: QueuedRaftEvent = { id, receivedAt: new Date().toISOString(), message }
-      const candidate = { schemaVersion: 1 as const, events: [...rest, ...additions, addition] }
+      const candidate = {
+        schemaVersion: 1 as const,
+        events: [...rest, ...additions, addition],
+        recentEventIds,
+      }
       if (Buffer.byteLength(JSON.stringify(candidate)) > MAX_QUEUE_BYTES) break
       additions.push(addition)
       known.add(id)
       consumed += 1
     }
     queue.events = [...rest, ...additions]
+    queue.recentEventIds = recentEventIds
     await writeJsonAtomic(this.queuePath, queue)
     return { added: additions.length, consumed }
   }

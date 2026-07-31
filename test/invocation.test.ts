@@ -89,6 +89,8 @@ describe('shared invocation and system tasks', () => {
 
   it('resolves a system assignment notice to the canonical task thread', async () => {
     raft.addTask({ channel: '#tasks', taskNumber: 7, title: 'Ship it', status: 'todo', messageId: 'task-7' })
+    const canonical = raft.messages.get('task-7')
+    if (!canonical) throw new Error('Missing canonical task fixture')
     raft.events.push(
       shared({
         id: 'notice-1',
@@ -99,14 +101,17 @@ describe('shared invocation and system tasks', () => {
         channel_name: raft.agentName,
         content: '📋 1 new task created: #7 "Ship it"',
       }),
+      canonical,
     )
 
     await service.drain()
     await service.processNext()
 
-    expect(raft.sent.at(-1)).toMatchObject({ target: '#tasks:task-7' })
+    expect(raft.sent).toEqual([expect.objectContaining({ target: '#tasks:task-7', content: 'Echo: Ship it' })])
     expect(raft.reactions).toContainEqual({ messageId: 'task-7', emoji: '✅', operation: 'add' })
     expect(raft.tasks[0]?.status).toBe('in_review')
+    expect(await service.processNext()).toBe(false)
+    expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
   })
 
   it.each(['missing', 'ambiguous'])('drops a %s system task resolution without blocking later work', async (mode) => {

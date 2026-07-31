@@ -546,7 +546,7 @@ export class EveRaftService {
 
   private async processEvent(event: QueuedRaftEvent): Promise<void> {
     this.assertConnected()
-    const raw = event.message
+    const raw = await this.canonicalPendingInputMessage(event.message)
     const task = rawAssignedTask(raw, this.credential!.agentId)
     const systemTask = rawSenderType(raw) === 'system' ? task : null
     let taskAnchor = event.taskAnchor
@@ -683,6 +683,31 @@ export class EveRaftService {
     }
     await this.bestEffortReaction(reactionMessageId, '✅')
     await this.bestEffortRemoveReaction(reactionMessageId, '👀')
+  }
+
+  private async canonicalPendingInputMessage(raw: RawRaftMessage): Promise<RawRaftMessage> {
+    if (Object.keys(this.pendingInput.byReplyTarget).length === 0) return raw
+    try {
+      if (this.pendingInput.byReplyTarget[messageTarget(raw).replyTarget]) return raw
+    } catch {
+      // A canonical resolve below may recover an incomplete event target.
+    }
+    const messageId = rawMessageId(raw)
+    if (!messageId) return raw
+    let resolved: RawRaftMessage
+    try {
+      resolved = await this.raft!.resolveMessage(messageId)
+    } catch (error) {
+      if (error instanceof HttpResponseError && error.status === 404) return raw
+      throw error
+    }
+    let resolvedReplyTarget: string
+    try {
+      resolvedReplyTarget = messageTarget(resolved).replyTarget
+    } catch {
+      return raw
+    }
+    return this.pendingInput.byReplyTarget[resolvedReplyTarget] ? { ...raw, ...resolved } : raw
   }
 
   private async normalizeMessage(

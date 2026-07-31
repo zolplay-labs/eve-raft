@@ -177,6 +177,45 @@ describe('Eve Raft service', () => {
     expect(raft.sent.at(-1)?.content).toBe('Resumed: two')
   })
 
+  it('resolves a wake event to the canonical pending-input thread', async () => {
+    const instance = await service()
+    raft.events.push(message({ id: 'rootabcd-1111', message_id: 'rootabcd-1111', content: 'ask me first' }))
+    await instance.drain()
+    await instance.processNext()
+
+    raft.messages.set(
+      'answerxy-2222',
+      message({
+        seq: 2,
+        id: 'answerxy-2222',
+        message_id: 'answerxy-2222',
+        channel_type: 'thread',
+        channel_name: 'rootabcd',
+        parent_channel_type: 'dm',
+        parent_channel_name: 'Dex',
+        content: '2',
+      }),
+    )
+    raft.events.push(
+      message({
+        seq: 2,
+        id: 'answerxy-2222',
+        message_id: 'answerxy-2222',
+        channel_type: 'dm',
+        channel_name: 'Dex',
+        content: '2',
+      }),
+    )
+    await instance.drain()
+    await instance.processNext()
+
+    expect(eve.inputs.at(-1)?.input).toMatchObject({
+      inputResponses: [{ requestId: 'approval-request', optionId: 'two' }],
+    })
+    expect(raft.sent.at(-1)?.content).toBe('Resumed: two')
+    expect(raft.sent).not.toContainEqual(expect.objectContaining({ content: 'Echo: 2' }))
+  })
+
   it('keeps pending input across a restart and guides an invalid answer', async () => {
     const first = await service()
     raft.events.push(message({ content: 'ask me first' }))

@@ -78,10 +78,10 @@ describe('co-located Eve supervisor', () => {
     ).rejects.toThrow('loopback host')
   })
 
-  it('escalates shutdown when the Eve child ignores SIGTERM', async () => {
+  it.skipIf(process.platform === 'win32')('stops the child process group when a wrapper exits first', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-runtime-stubborn-'))
     const evePort = await unusedPort()
-    const childScript = [
+    const eveScript = [
       "const http = require('node:http')",
       "const host = process.argv[process.argv.indexOf('--host') + 1]",
       "const port = Number(process.argv[process.argv.indexOf('--port') + 1])",
@@ -89,13 +89,19 @@ describe('co-located Eve supervisor', () => {
       'server.listen(port, host)',
       "process.on('SIGTERM', () => {})",
     ].join(';')
+    const wrapperScript = [
+      `const { spawn } = require('node:child_process')`,
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(eveScript)}, '--', ...process.argv.slice(1)], { stdio: 'inherit' })`,
+      "process.on('SIGTERM', () => process.exit(0))",
+      "child.on('exit', (code) => process.exit(code ?? 0))",
+    ].join(';')
     const runtime = await startSupervisedRuntime({
       stateDirectory: directory,
       healthHost: '127.0.0.1',
       healthPort: 0,
       eveHost: '127.0.0.1',
       evePort,
-      childCommand: [process.execPath, '-e', childScript, '--'],
+      childCommand: [process.execPath, '-e', wrapperScript, '--'],
       childShutdownGraceMs: 25,
       childKillWaitMs: 250,
     })
@@ -108,5 +114,16 @@ describe('co-located Eve supervisor', () => {
       ]),
     ).resolves.toBe('stopped')
     await runtime.done
+
+    const replacement = createServer()
+    try {
+      await new Promise<void>((resolve, reject) =>
+        replacement.listen(evePort, '127.0.0.1', resolve).once('error', reject),
+      )
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        replacement.listening ? replacement.close((error) => (error ? reject(error) : resolve())) : resolve(),
+      )
+    }
   })
 })

@@ -122,17 +122,56 @@ async function waitForChildExit(exited: Promise<ChildExit>, timeoutMs: number): 
   }
 }
 
+function processGroupExists(processGroupId: number): boolean {
+  try {
+    process.kill(-processGroupId, 0)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
+    if ((error as NodeJS.ErrnoException).code === 'EPERM') return true
+    throw error
+  }
+}
+
+async function waitForProcessGroupExit(processGroupId: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (processGroupExists(processGroupId)) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return false
+    await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 25)))
+  }
+  return true
+}
+
+function signalChildTree(child: ChildProcess, processGroupId: number | null, signal: NodeJS.Signals): void {
+  if (processGroupId === null) {
+    child.kill(signal)
+    return
+  }
+  try {
+    process.kill(-processGroupId, signal)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
+}
+
 async function terminateChild(
   child: ChildProcess,
   exited: Promise<ChildExit>,
+  processGroupId: number | null,
   shutdownGraceMs: number,
   killWaitMs: number,
 ): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  child.kill('SIGTERM')
-  if (await waitForChildExit(exited, shutdownGraceMs)) return
-  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-  await waitForChildExit(exited, killWaitMs)
+  const treeExited = (timeoutMs: number): Promise<boolean> =>
+    processGroupId === null ? waitForChildExit(exited, timeoutMs) : waitForProcessGroupExit(processGroupId, timeoutMs)
+  const treeRunning = (): boolean =>
+    processGroupId === null ? child.exitCode === null && child.signalCode === null : processGroupExists(processGroupId)
+
+  if (!treeRunning()) return
+  signalChildTree(child, processGroupId, 'SIGTERM')
+  if (await treeExited(shutdownGraceMs)) return
+  if (treeRunning()) signalChildTree(child, processGroupId, 'SIGKILL')
+  await treeExited(killWaitMs)
 }
 
 async function waitForEve(origin: string, child: ChildProcess, signal: AbortSignal): Promise<void> {
@@ -181,14 +220,16 @@ export async function startSupervisedRuntime(options: SupervisedRuntimeOptions):
       EVE_RAFT_CHANNEL_TOKEN: settings.channelToken,
       PORT: String(options.evePort),
     },
+    detached: process.platform !== 'win32',
     stdio: 'inherit',
   })
   const exited = childExit(child)
+  const processGroupId = process.platform !== 'win32' && child.pid ? child.pid : null
   const shutdownGraceMs = options.childShutdownGraceMs ?? DEFAULT_CHILD_SHUTDOWN_GRACE_MS
   const killWaitMs = options.childKillWaitMs ?? DEFAULT_CHILD_KILL_WAIT_MS
 
   const stopChild = (): Promise<void> => {
-    childTerminationPromise ??= terminateChild(child, exited, shutdownGraceMs, killWaitMs)
+    childTerminationPromise ??= terminateChild(child, exited, processGroupId, shutdownGraceMs, killWaitMs)
     return childTerminationPromise
   }
 

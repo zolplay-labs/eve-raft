@@ -546,7 +546,7 @@ export class EveRaftService {
 
   private async processEvent(event: QueuedRaftEvent): Promise<void> {
     this.assertConnected()
-    const raw = await this.canonicalPendingInputMessage(event.message)
+    let raw = await this.canonicalPendingInputMessage(event.message)
     const canonicalId = rawMessageId(raw)
     if (canonicalId && canonicalId !== event.id && canonicalId !== event.canonicalId) {
       await this.store.checkpointHead(this.queue, event.id, { canonicalId })
@@ -563,6 +563,7 @@ export class EveRaftService {
       }
       const canonical = await this.raft!.resolveMessage(resolved.messageId)
       const target = messageTarget(canonical)
+      raw = { ...raw, ...canonical }
       taskAnchor = { messageId: resolved.messageId, replyTarget: target.replyTarget, taskChannel: resolved.channel }
       await this.store.checkpointHead(this.queue, event.id, {
         taskAnchor,

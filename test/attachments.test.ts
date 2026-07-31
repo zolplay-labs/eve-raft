@@ -86,7 +86,7 @@ describe('Raft attachments', () => {
       { type: 'text', text: expect.stringMatching(/^<!-- eve-raft-event:[a-f0-9]{64} -->\nreview this$/u) },
       expect.objectContaining({ type: 'file', mediaType: 'image/png', filename: 'brief.png' }),
     ])
-    expect(Buffer.isBuffer(input[1]?.data)).toBe(true)
+    expect(input[1]?.data).toBe(PNG_BYTES.toString('base64'))
   })
 
   it.each([

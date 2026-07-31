@@ -11,6 +11,10 @@ import { FakeRaftServer } from './fake-raft-server.ts'
 
 const execFile = promisify(execFileCallback)
 const root = path.resolve(import.meta.dirname, '..')
+const PNG_BYTES = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+)
 
 function stopProcess(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
@@ -33,6 +37,17 @@ async function waitForHealth(origin: string, path = '/health'): Promise<Record<s
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   throw new Error('Packed standalone Eve Raft fixture did not become healthy')
+}
+
+async function waitForSentContent(raft: FakeRaftServer, fromIndex: number, expected: string): Promise<void> {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    if (raft.sent.slice(fromIndex).some((message) => message.content.includes(expected))) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(
+    `Packed standalone Eve Raft fixture did not send: ${expected}; sent: ${JSON.stringify(raft.sent.slice(fromIndex))}`,
+  )
 }
 
 describe('packed registry installation', () => {
@@ -133,7 +148,12 @@ describe('packed registry installation', () => {
         eveBinary,
         'start',
       ]
-      const startFixture = () => spawn(eveRaftBinary, startArguments, { cwd: fixtureDirectory, stdio: 'ignore' })
+      const startFixture = () =>
+        spawn(eveRaftBinary, startArguments, {
+          cwd: fixtureDirectory,
+          env: { ...process.env, NODE_ENV: 'production' },
+          stdio: 'ignore',
+        })
       eve = startFixture()
       const health = await waitForHealth(origin)
       expect(health).toMatchObject({ ok: true, eveReady: true, state: 'connected', protocolVersion: 1 })
@@ -165,25 +185,40 @@ describe('packed registry installation', () => {
       ])
       expect(raft.activity.length).toBeGreaterThan(0)
 
+      raft.attachments.set('packed-attachment', { bytes: PNG_BYTES, mediaType: 'image/png' })
+      raft.events.push({
+        seq: 2,
+        id: 'message-packed-attachment',
+        message_id: 'message-packed-attachment',
+        timestamp: '2026-07-31T00:00:01.000Z',
+        sender_type: 'human',
+        sender_name: 'cali',
+        channel_type: 'dm',
+        channel_name: raft.agentName,
+        content: 'hello with packed attachment',
+        attachments: [{ id: 'packed-attachment', filename: 'fixture.png' }],
+      })
+      await waitForSentContent(raft, 1, 'Fixture received exact PNG attachment')
+      expect(raft.sent).toHaveLength(2)
+      expect(raft.sent[1]).toMatchObject({ content: expect.stringContaining('Fixture received exact PNG attachment') })
+
       await stopProcess(eve)
       eve = startFixture()
       expect(await waitForHealth(origin)).toMatchObject({ state: 'connected' })
       raft.events.push({
-        seq: 2,
+        seq: 3,
         id: 'message-after-restart',
         message_id: 'message-after-restart',
-        timestamp: '2026-07-31T00:00:01.000Z',
+        timestamp: '2026-07-31T00:00:02.000Z',
         sender_type: 'human',
         sender_name: 'cali',
         channel_type: 'dm',
         channel_name: raft.agentName,
         content: 'after restart',
       })
-      const restartDeadline = Date.now() + 15_000
-      while (raft.sent.length < 2 && Date.now() < restartDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
-      }
-      expect(raft.sent.at(-1)).toMatchObject({ content: expect.stringContaining('after restart') })
+      await waitForSentContent(raft, 2, 'after restart')
+      expect(raft.sent).toHaveLength(3)
+      expect(raft.sent[2]).toMatchObject({ content: expect.stringContaining('after restart') })
     } finally {
       if (eve) await stopProcess(eve)
       await raft.stop()

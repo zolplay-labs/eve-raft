@@ -10,7 +10,8 @@
   "dependencies": {
     "@zolplay/eve-raft": "workspace:*",
     "ai": "^7.0.38",
-    "eve": "0.29.2"
+    "eve": "0.29.2",
+    "just-bash": "3.1.0"
   },
   "engines": {
     "node": ">=24"

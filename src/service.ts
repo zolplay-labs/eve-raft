@@ -529,7 +529,7 @@ export class EveRaftService {
       return true
     }
 
-    if (error.operation !== 'send' || startedTask) {
+    if (error.operation !== 'send' || startedTask || checkpointed.pendingInputExpiry !== undefined) {
       const deferred = await this.store.deferHeadEvent(this.queue, event.id, messages, {
         ...(typeof cursor === 'number' ? { seenUpToSeq: cursor } : {}),
       })
@@ -590,7 +590,11 @@ export class EveRaftService {
   private async processEvent(event: QueuedRaftEvent): Promise<void> {
     this.assertConnected()
     if (event.pendingInputExpiry) {
-      await this.expirePendingInput(event, event.pendingInputExpiry)
+      const seenUpToSeq = Math.max(event.pendingInputExpiry.seenUpToSeq ?? -1, event.freshnessSeenUpToSeq ?? -1)
+      await this.expirePendingInput(event, {
+        ...event.pendingInputExpiry,
+        ...(seenUpToSeq >= 0 ? { seenUpToSeq } : {}),
+      })
       return
     }
     let raw = await this.canonicalPendingInputMessage(event.message)

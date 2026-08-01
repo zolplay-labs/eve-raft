@@ -382,6 +382,67 @@ describe('Eve Raft service', () => {
     expect((await new StateStore(stateDirectory).loadQueue()).events).toEqual([])
   })
 
+  it('keeps a pending-input expiry durable through a freshness hold', async () => {
+    const instance = await service()
+    raft.events.push(message({ id: 'expired2-root', message_id: 'expired2-root', content: 'ask me first' }))
+    await instance.drain()
+    await instance.processNext()
+    eve.expireSessions()
+
+    raft.events.push(
+      message({
+        seq: 2,
+        id: 'expired2-answer',
+        message_id: 'expired2-answer',
+        channel_type: 'thread',
+        channel_name: 'thread-expired2',
+        parent_channel_type: 'dm',
+        parent_channel_name: 'Dex',
+        content: '1',
+      }),
+    )
+    await instance.drain()
+    raft.nextSendFailure = {
+      status: 200,
+      body: {
+        state: 'held',
+        seenUpToSeq: 3,
+        heldMessages: [
+          message({
+            seq: 3,
+            id: 'newer-context',
+            message_id: 'newer-context',
+            content: 'newer context',
+          }),
+        ],
+      },
+    }
+
+    await expect(instance.processNext()).resolves.toBe(true)
+
+    const afterHold = await new StateStore(stateDirectory).loadQueue()
+    expect(afterHold.events.map((event) => event.id)).toEqual(['newer-context', 'expired2-answer'])
+    expect(afterHold.events[1]).toMatchObject({
+      freshnessSeenUpToSeq: 3,
+      pendingInputExpiry: {
+        target: 'dm:@Dex:expired2',
+        replyTarget: 'dm:@Dex:expired2',
+        seenUpToSeq: 2,
+      },
+    })
+    expect((await new StateStore(stateDirectory).loadPendingInput()).byReplyTarget).toEqual({})
+
+    await instance.processNext()
+    await instance.processNext()
+
+    expect(raft.sent.filter((sent) => sent.content.includes('question expired'))).toEqual([
+      expect.objectContaining({ target: 'dm:@Dex:expired2', seenUpToSeq: 3 }),
+    ])
+    expect(raft.sent.map((sent) => sent.content)).not.toContain('Echo: 1')
+    expect(raft.sent.map((sent) => sent.content)).not.toContain('Resumed: one')
+    expect((await new StateStore(stateDirectory).loadQueue()).events).toEqual([])
+  })
+
   it('keeps a wrong-thread answer isolated and applies a duplicate only once', async () => {
     const instance = await service()
     raft.events.push(message({ content: 'ask me first' }))

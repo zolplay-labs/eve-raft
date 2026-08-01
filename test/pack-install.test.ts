@@ -69,6 +69,15 @@ describe('packed registry installation', () => {
     const packDirectory = path.join(workspace, 'pack')
     const fixtureDirectory = path.join(workspace, 'fixture')
     const stateDirectory = path.join(workspace, 'state')
+    const standaloneFixtureDirectory = path.join(root, 'fixtures/standalone')
+    const standaloneFixtureManifest = JSON.parse(
+      await readFile(path.join(standaloneFixtureDirectory, 'package.json'), 'utf8'),
+    ) as { dependencies?: Record<string, string> }
+    expect(standaloneFixtureManifest.dependencies).toMatchObject({ 'just-bash': '3.1.0' })
+    await execFile(process.execPath, ['--input-type=module', '-e', 'await import("just-bash")'], {
+      cwd: standaloneFixtureDirectory,
+    })
+
     const raft = new FakeRaftServer()
     await raft.start()
     await mkdir(packDirectory)

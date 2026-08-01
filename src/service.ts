@@ -386,6 +386,7 @@ export interface EveRaftServiceOptions<TAttachment = RaftAttachment> {
   eve?: EveRaftTransport<TAttachment>
   prepareAttachment?: EveRaftAttachmentPreparer<TAttachment>
   deliveryKey?: EveRaftDeliveryKeyFactory
+  adoptLegacyState?: boolean
 }
 
 export type EveRaftDeliveryKind = 'expired-input' | 'failed' | 'final' | 'hitl' | 'immediate' | 'invalid-input'
@@ -434,7 +435,7 @@ export type EveRaftAttachmentPreparer<TAttachment = RaftAttachment> = (
   input: EveRaftAttachmentInput,
 ) => TAttachment | Promise<TAttachment>
 
-function inlineAttachment(input: EveRaftAttachmentInput): RaftAttachment {
+export function prepareInlineAttachment(input: EveRaftAttachmentInput): RaftAttachment {
   return {
     id: input.id,
     fileName: input.fileName,
@@ -460,6 +461,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   private readonly connectionSource: EveRaftConnectionSource | null
   private readonly prepareAttachment: EveRaftAttachmentPreparer<TAttachment>
   private readonly deliveryKeyFactory: EveRaftDeliveryKeyFactory | null
+  private readonly adoptLegacyState: boolean
   private readonly connectionLock = new AsyncLock()
   private credential: EveRaftConnectionIdentity | null = null
   private raft: RaftClient | null = null
@@ -474,15 +476,20 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     this.store = new StateStore(options.stateDirectory)
     if (options.eve) {
       this.eve = options.eve
+      if (!options.prepareAttachment) {
+        throw new Error('prepareAttachment is required when a consumer Eve transport is provided')
+      }
+      this.prepareAttachment = options.prepareAttachment
     } else {
       if (!options.eveOrigin || !options.channelToken) {
         throw new Error('eveOrigin and channelToken are required when no consumer Eve transport is provided')
       }
       this.eve = new EveClient(options.eveOrigin, options.channelToken) as EveRaftTransport<TAttachment>
+      this.prepareAttachment = prepareInlineAttachment as EveRaftAttachmentPreparer<TAttachment>
     }
     this.connectionSource = options.connectionSource ?? null
-    this.prepareAttachment = options.prepareAttachment ?? (inlineAttachment as EveRaftAttachmentPreparer<TAttachment>)
     this.deliveryKeyFactory = options.deliveryKey ?? null
+    this.adoptLegacyState = options.adoptLegacyState === true
   }
 
   async initialize(): Promise<void> {
@@ -523,7 +530,8 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       if (
         !connected &&
         this.health.lastError !== 'credential_rejected' &&
-        this.health.lastError !== 'connection_identity_conflict'
+        this.health.lastError !== 'connection_identity_conflict' &&
+        this.health.lastError !== 'legacy_state_identity_unbound'
       ) {
         this.health.state = 'unconfigured'
         this.health.serverUrl = null
@@ -545,7 +553,8 @@ export class EveRaftService<TAttachment = RaftAttachment> {
               return {
                 preserveError:
                   this.health.lastError === 'credential_rejected' ||
-                  this.health.lastError === 'connection_identity_conflict',
+                  this.health.lastError === 'connection_identity_conflict' ||
+                  this.health.lastError === 'legacy_state_identity_unbound',
                 processed: false,
               }
             }
@@ -553,7 +562,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
             return { preserveError: false, processed: await this.processNextUnlocked() }
           } catch (error) {
             if (!isRaftAuthenticationFailure(error)) throw error
-            await this.rejectConnection(error)
+            this.rejectConnection(error)
             failures = 0
             return { preserveError: true, processed: false }
           }
@@ -711,7 +720,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       server = resolved[1]
     } catch (error) {
       if (isRaftAuthenticationFailure(error)) {
-        await this.rejectConnection(error)
+        this.rejectConnection(error)
         return false
       }
       throw error
@@ -724,7 +733,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     ) {
       const error = new Error('Stored Raft credential does not match the configured agent and server')
       if (!this.connectionSource) throw error
-      await this.rejectConnection(error)
+      this.rejectConnection(error)
       return false
     }
     if (!(await this.bindDeliveryIdentity(identity))) return false
@@ -744,13 +753,13 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     this.health.lastError = lastError
   }
 
-  private async rejectConnection(error: Error): Promise<void> {
+  private rejectConnection(error: Error): void {
     this.disconnect('credential_rejected')
-    try {
-      await this.connectionSource?.rejected?.(error)
-    } catch {
-      this.health.lastError = 'credential_rejected'
-    }
+    const rejected = this.connectionSource?.rejected
+    if (!rejected) return
+    void Promise.resolve()
+      .then(() => rejected(error))
+      .catch(() => undefined)
   }
 
   private async bindDeliveryIdentity(identity: EveRaftConnectionIdentity): Promise<boolean> {
@@ -760,7 +769,22 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       agentId: identity.agentId,
     }
     if (!this.deliveryIdentity) {
-      await this.store.saveDeliveryIdentity(next)
+      if (
+        !this.adoptLegacyState &&
+        (this.queue.events.length > 0 ||
+          this.pendingEvents.length > 0 ||
+          Object.keys(this.pendingInput.byReplyTarget).length > 0)
+      ) {
+        this.disconnect('legacy_state_identity_unbound')
+        return false
+      }
+      if (this.queue.recentEventIds.length > 0) {
+        await this.store.rebindEmptyDeliveryState(this.queue, next)
+        this.pendingEvents = []
+        this.pendingInput = { schemaVersion: 1, byReplyTarget: {} }
+      } else {
+        await this.store.saveDeliveryIdentity(next)
+      }
       this.deliveryIdentity = next
       return true
     }

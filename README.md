@@ -146,6 +146,7 @@ await service.run(abortSignal)
 
 Call `service.reloadConnection()` after the consumer activates, rotates, or revokes a credential. The standalone CLI remains the default path and keeps credentials plus inline Base64 attachments inside its own persistent runtime.
 Consumers migrating an existing delivery loop can also provide `deliveryKey` to preserve their prior platform idempotency keys while queued work is replayed.
+Legacy queued or pending state without a `delivery-identity.json` binding fails closed by default. Set `adoptLegacyState: true` only after the consumer has verified that the active stable Raft identity owns that state.
 
 ## Development
 

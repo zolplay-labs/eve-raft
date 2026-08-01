@@ -1,4 +1,4 @@
-export { EveRaftService } from './service.js'
+export { EveRaftService, prepareInlineAttachment } from './service.js'
 export type {
   EveRaftAttachmentInput,
   EveRaftAttachmentPreparer,

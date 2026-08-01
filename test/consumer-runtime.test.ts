@@ -1,11 +1,16 @@
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { RaftClient } from '../src/raft-client.ts'
-import { EveRaftService, type EveRaftConnectionSource, type EveRaftTransport } from '../src/service.ts'
+import {
+  EveRaftService,
+  prepareInlineAttachment,
+  type EveRaftConnectionSource,
+  type EveRaftTransport,
+} from '../src/service.ts'
 import type { RaftCredential } from '../src/state.ts'
 import type { RaftAttachmentMediaType, RaftEventEnvelope } from '../src/types.ts'
 import { FakeRaftServer } from './fake-raft-server.ts'
@@ -53,6 +58,16 @@ describe('consumer-owned Eve Raft runtime', () => {
   })
 
   afterEach(() => raft.stop())
+
+  it('requires an attachment preparer for a consumer transport', () => {
+    expect(
+      () =>
+        new EveRaftService({
+          stateDirectory: '/tmp/eve-raft-consumer-preparer',
+          eve: { dispatch: vi.fn(), stream: vi.fn() },
+        }),
+    ).toThrow('prepareAttachment is required when a consumer Eve transport is provided')
+  })
 
   it('uses consumer transports without storing credentials or attachment bytes', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-'))
@@ -150,6 +165,7 @@ describe('consumer-owned Eve Raft runtime', () => {
         stream: vi.fn(),
       },
       deliveryKey: (input) => `dex-${input.kind}-${input.sourceMessageId}`,
+      prepareAttachment: prepareInlineAttachment,
     })
 
     await service.initialize()
@@ -177,7 +193,12 @@ describe('consumer-owned Eve Raft runtime', () => {
       dispatch: vi.fn(),
       stream: vi.fn(),
     }
-    const service = new EveRaftService({ stateDirectory, connectionSource, eve })
+    const service = new EveRaftService({
+      stateDirectory,
+      connectionSource,
+      eve,
+      prepareAttachment: prepareInlineAttachment,
+    })
     await service.initialize()
     expect(service.health.state).toBe('unconfigured')
 
@@ -186,6 +207,49 @@ describe('consumer-owned Eve Raft runtime', () => {
     await expect(service.reloadConnection()).resolves.toBe(true)
     expect(service.health).toMatchObject({ state: 'connected', serverUrl: raft.origin, lastError: null })
     expect(connectionSource.load).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails closed on unbound legacy work unless the consumer explicitly adopts it', async () => {
+    const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-legacy-state-'))
+    await writeFile(
+      path.join(stateDirectory, 'queue.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        events: [
+          {
+            id: 'legacy-message',
+            receivedAt: '2026-08-01T00:00:00.000Z',
+            message: { id: 'legacy-message' },
+          },
+        ],
+      }),
+    )
+    const credential = credentialFor(raft)
+    const connectionSource: EveRaftConnectionSource = {
+      load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
+    }
+    const eve: EveRaftTransport = { dispatch: vi.fn(), stream: vi.fn() }
+    const service = new EveRaftService({
+      stateDirectory,
+      connectionSource,
+      eve,
+      prepareAttachment: prepareInlineAttachment,
+    })
+
+    await service.initialize()
+
+    expect(service.health).toMatchObject({ state: 'disconnected', lastError: 'legacy_state_identity_unbound' })
+    await expect(service.reloadConnection()).resolves.toBe(false)
+
+    const adopted = new EveRaftService({
+      stateDirectory,
+      connectionSource,
+      eve,
+      prepareAttachment: prepareInlineAttachment,
+      adoptLegacyState: true,
+    })
+    await adopted.initialize()
+    expect(adopted.health).toMatchObject({ state: 'connected', lastError: null })
   })
 
   it('waits for an in-flight delivery before reloading the connection', async () => {
@@ -221,7 +285,12 @@ describe('consumer-owned Eve Raft runtime', () => {
       channel_name: 'Dex',
       content: 'hello',
     })
-    const service = new EveRaftService({ stateDirectory, connectionSource, eve })
+    const service = new EveRaftService({
+      stateDirectory,
+      connectionSource,
+      eve,
+      prepareAttachment: prepareInlineAttachment,
+    })
     await service.initialize()
     await service.drain()
 
@@ -268,6 +337,7 @@ describe('consumer-owned Eve Raft runtime', () => {
         stateDirectory,
         connectionSource,
         eve: { dispatch, stream: vi.fn() },
+        prepareAttachment: prepareInlineAttachment,
       })
       await service.initialize()
       await service.drain()
@@ -314,6 +384,7 @@ describe('consumer-owned Eve Raft runtime', () => {
         stateDirectory,
         connectionSource,
         eve: { dispatch, stream: vi.fn() },
+        prepareAttachment: prepareInlineAttachment,
       })
       await service.initialize()
       await service.drain()
@@ -347,10 +418,12 @@ describe('consumer-owned Eve Raft runtime', () => {
       stateDirectory,
       connectionSource,
       eve: { dispatch: vi.fn(), stream: vi.fn() },
+      prepareAttachment: prepareInlineAttachment,
     })
 
     await service.initialize()
 
+    await waitFor(() => rejected.mock.calls.length === 1)
     expect(rejected).toHaveBeenCalledWith(
       expect.objectContaining({ message: 'Stored Raft credential does not match the configured agent and server' }),
     )
@@ -369,6 +442,7 @@ describe('consumer-owned Eve Raft runtime', () => {
       stateDirectory,
       connectionSource,
       eve: { dispatch: vi.fn(), stream: vi.fn() },
+      prepareAttachment: prepareInlineAttachment,
     })
     await service.initialize()
     raft.apiKey = 'replacement-key'
@@ -396,10 +470,12 @@ describe('consumer-owned Eve Raft runtime', () => {
       stateDirectory,
       connectionSource,
       eve: { dispatch: vi.fn(), stream: vi.fn() },
+      prepareAttachment: prepareInlineAttachment,
     })
 
     await service.initialize()
 
+    await waitFor(() => rejected.mock.calls.length === 1)
     expect(rejected).toHaveBeenCalledOnce()
     expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }))
     expect(service.health).toMatchObject({ state: 'disconnected', lastError: 'credential_rejected' })
@@ -418,11 +494,39 @@ describe('consumer-owned Eve Raft runtime', () => {
         rejected,
       },
       eve: { dispatch: vi.fn(), stream: vi.fn() },
+      prepareAttachment: prepareInlineAttachment,
     })
 
     await expect(service.initialize()).resolves.toBeUndefined()
 
+    await waitFor(() => rejected.mock.calls.length === 1)
     expect(rejected).toHaveBeenCalledOnce()
     expect(service.health).toMatchObject({ state: 'disconnected', lastError: 'credential_rejected' })
+  })
+
+  it('lets a rejection callback reload a rotated credential without deadlocking', async () => {
+    const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-rejection-reload-'))
+    let credential = credentialFor(raft, { apiKey: 'rejected-key' })
+    let service: EveRaftService
+    let reloaded = false
+    const connectionSource: EveRaftConnectionSource = {
+      load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
+      rejected: vi.fn(async () => {
+        credential = credentialFor(raft)
+        reloaded = await service.reloadConnection()
+      }),
+    }
+    service = new EveRaftService({
+      stateDirectory,
+      connectionSource,
+      eve: { dispatch: vi.fn(), stream: vi.fn() },
+      prepareAttachment: prepareInlineAttachment,
+    })
+
+    await service.initialize()
+    await waitFor(() => reloaded)
+
+    expect(service.health).toMatchObject({ state: 'connected', lastError: null })
+    expect(connectionSource.load).toHaveBeenCalledTimes(2)
   })
 })

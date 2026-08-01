@@ -782,16 +782,15 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       agentId: identity.agentId,
     }
     if (!this.deliveryIdentity) {
-      if (
-        !this.adoptLegacyState &&
-        (this.queue.events.length > 0 ||
-          this.pendingEvents.length > 0 ||
-          Object.keys(this.pendingInput.byReplyTarget).length > 0)
-      ) {
+      const hasPendingWork =
+        this.queue.events.length > 0 ||
+        this.pendingEvents.length > 0 ||
+        Object.keys(this.pendingInput.byReplyTarget).length > 0
+      if (!this.adoptLegacyState && hasPendingWork) {
         this.disconnect('legacy_state_identity_unbound')
         return false
       }
-      if (this.queue.recentEventIds.length > 0) {
+      if (!this.adoptLegacyState && this.queue.recentEventIds.length > 0) {
         await this.store.rebindEmptyDeliveryState(this.queue, next)
         this.pendingEvents = []
         this.pendingInput = { schemaVersion: 1, byReplyTarget: {} }

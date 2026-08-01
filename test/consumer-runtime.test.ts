@@ -11,7 +11,7 @@ import {
   type EveRaftConnectionSource,
   type EveRaftTransport,
 } from '../src/service.ts'
-import type { RaftCredential } from '../src/state.ts'
+import { StateStore, type RaftCredential } from '../src/state.ts'
 import type { RaftAttachmentMediaType, RaftEventEnvelope } from '../src/types.ts'
 import { FakeRaftServer } from './fake-raft-server.ts'
 
@@ -229,6 +229,7 @@ describe('consumer-owned Eve Raft runtime', () => {
             message: { id: 'legacy-message' },
           },
         ],
+        recentEventIds: ['legacy-completed-message'],
       }),
     )
     const credential = credentialFor(raft)
@@ -257,6 +258,10 @@ describe('consumer-owned Eve Raft runtime', () => {
     })
     await adopted.initialize()
     expect(adopted.health).toMatchObject({ state: 'connected', lastError: null })
+    await expect(new StateStore(stateDirectory).loadQueue()).resolves.toMatchObject({
+      events: [{ id: 'legacy-message' }],
+      recentEventIds: ['legacy-completed-message'],
+    })
   })
 
   it('waits for an in-flight delivery before reloading the connection', async () => {

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, readdir, readlink, rename, rmdir, symlink } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { createRequire } from 'node:module'
 import path from 'node:path'
@@ -96,6 +96,66 @@ function supervisedChildCommand(command: string[], host: string, port: number): 
 function closeServer(server: Server): Promise<void> {
   if (!server.listening) return Promise.resolve()
   return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
+}
+
+async function pathStat(pathname: string) {
+  try {
+    return await lstat(pathname)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+}
+
+async function prepareWorkflowDataLink(cwd: string, workflowDirectory: string): Promise<void> {
+  const localDirectory = path.join(cwd, '.eve', '.workflow-data')
+  const persistentRelativeToLocal = path.relative(localDirectory, workflowDirectory)
+  if (
+    persistentRelativeToLocal === '' ||
+    (persistentRelativeToLocal !== '..' &&
+      !persistentRelativeToLocal.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(persistentRelativeToLocal))
+  ) {
+    throw new Error("The persistent state directory cannot be inside Eve's local workflow-data path")
+  }
+  await mkdir(path.dirname(localDirectory), { recursive: true })
+  const local = await pathStat(localDirectory)
+  if (local?.isSymbolicLink()) {
+    const linked = path.resolve(path.dirname(localDirectory), await readlink(localDirectory))
+    if (linked !== workflowDirectory) {
+      throw new Error(`Eve workflow data is linked outside the persistent state directory: ${localDirectory}`)
+    }
+    return
+  }
+  if (local && !local.isDirectory()) throw new Error(`Eve workflow data path is not a directory: ${localDirectory}`)
+
+  const persistent = await pathStat(workflowDirectory)
+  if (persistent && !persistent.isDirectory()) {
+    throw new Error(`Persistent Eve workflow data path is not a directory: ${workflowDirectory}`)
+  }
+  if (!local) {
+    await mkdir(workflowDirectory, { recursive: true, mode: 0o700 })
+    await chmod(workflowDirectory, 0o700)
+    await symlink(workflowDirectory, localDirectory, process.platform === 'win32' ? 'junction' : 'dir')
+    return
+  }
+
+  const [localEntries, persistentEntries] = await Promise.all([
+    readdir(localDirectory),
+    persistent ? readdir(workflowDirectory) : Promise.resolve([]),
+  ])
+  if (localEntries.length > 0 && persistentEntries.length > 0) {
+    throw new Error('Both local and persistent Eve workflow stores contain data; refusing to choose between them')
+  }
+  if (localEntries.length > 0) {
+    if (persistent) await rmdir(workflowDirectory)
+    await rename(localDirectory, workflowDirectory)
+  } else {
+    await rmdir(localDirectory)
+    await mkdir(workflowDirectory, { recursive: true, mode: 0o700 })
+  }
+  await chmod(workflowDirectory, 0o700)
+  await symlink(workflowDirectory, localDirectory, process.platform === 'win32' ? 'junction' : 'dir')
 }
 
 function childExit(child: ChildProcess): Promise<ChildExit> {
@@ -199,6 +259,7 @@ export async function startSupervisedRuntime(options: SupervisedRuntimeOptions):
   const versions = await runtimeVersions(cwd)
   const store = new StateStore(options.stateDirectory)
   await store.initialize()
+  await prepareWorkflowDataLink(cwd, store.workflowDirectory)
   const settings = await store.loadOrCreateSettings()
   const eveOrigin = `http://${options.eveHost.includes(':') ? `[${options.eveHost}]` : options.eveHost}:${options.evePort}`
   const service = new EveRaftService({

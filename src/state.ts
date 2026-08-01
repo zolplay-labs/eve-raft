@@ -31,6 +31,12 @@ export interface TaskAnchor {
   taskChannel: string
 }
 
+export interface PendingInputExpiry {
+  target: string
+  replyTarget: string
+  seenUpToSeq?: number
+}
+
 export interface PendingInputRequest {
   requestId: string
   prompt: string
@@ -47,6 +53,7 @@ export interface QueuedRaftEvent {
   taskAnchor?: TaskAnchor
   freshnessSeenUpToSeq?: number
   freshnessDeferred?: true
+  pendingInputExpiry?: PendingInputExpiry
   dispatch?: {
     target: string
     messageId: string
@@ -120,6 +127,15 @@ function validTaskAnchor(value: unknown): value is TaskAnchor {
     boundedString(value.messageId, 200) &&
     boundedString(value.replyTarget, 500) &&
     boundedString(value.taskChannel, 500)
+  )
+}
+
+function validPendingInputExpiry(value: unknown): value is PendingInputExpiry {
+  return (
+    isRecord(value) &&
+    boundedString(value.target, 500) &&
+    boundedString(value.replyTarget, 500) &&
+    (value.seenUpToSeq === undefined || (Number.isSafeInteger(value.seenUpToSeq) && Number(value.seenUpToSeq) >= 0))
   )
 }
 
@@ -206,6 +222,9 @@ function validateQueue(value: unknown): QueueFile {
     if (valueEvent.taskAnchor !== undefined && !validTaskAnchor(valueEvent.taskAnchor)) {
       throw new Error('Durable Raft task anchor is invalid')
     }
+    if (valueEvent.pendingInputExpiry !== undefined && !validPendingInputExpiry(valueEvent.pendingInputExpiry)) {
+      throw new Error('Durable Raft pending-input expiry checkpoint is invalid')
+    }
     if (valueEvent.dispatch !== undefined && !validDispatch(valueEvent.dispatch)) {
       throw new Error('Durable Raft dispatch checkpoint is invalid')
     }
@@ -225,6 +244,7 @@ export class StateStore {
   readonly queuePath: string
   readonly pendingEventsPath: string
   readonly pendingInputPath: string
+  readonly workflowDirectory: string
 
   constructor(directory: string) {
     this.directory = path.resolve(directory)
@@ -233,11 +253,13 @@ export class StateStore {
     this.queuePath = path.join(this.directory, 'queue.json')
     this.pendingEventsPath = path.join(this.directory, 'pending-events.json')
     this.pendingInputPath = path.join(this.directory, 'pending-input.json')
+    this.workflowDirectory = path.join(this.directory, 'eve-workflow')
   }
 
   async initialize(): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 })
-    await chmod(this.directory, 0o700)
+    await mkdir(this.workflowDirectory, { recursive: true, mode: 0o700 })
+    await Promise.all([chmod(this.directory, 0o700), chmod(this.workflowDirectory, 0o700)])
   }
 
   async loadCredential(): Promise<RaftCredential | null> {
@@ -373,6 +395,7 @@ export class StateStore {
         | 'taskAnchor'
         | 'freshnessSeenUpToSeq'
         | 'freshnessDeferred'
+        | 'pendingInputExpiry'
         | 'dispatch'
         | 'replyDelivered'
       >

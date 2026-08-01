@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { attachmentMatchesMediaType, stripRaftTransportMarkers } from './protocol.js'
 import { HttpResponseError, RaftClient, RaftFreshnessHoldError, type RaftProfile } from './raft-client.js'
 import {
+  type PendingInputExpiry,
   type PendingInputFile,
   type QueueFile,
   type QueuedRaftEvent,
@@ -27,6 +28,7 @@ import {
 
 const EVENT_POLL_MS = 2_000
 const MAX_BACKOFF_MS = 30_000
+const MAX_EVE_ERROR_BODY_BYTES = 8 * 1024
 const IDENTIFIER = /^[A-Za-z0-9_-]{1,160}$/u
 
 function hash(value: string): string {
@@ -241,10 +243,51 @@ class PermanentEventError extends Error {
 }
 
 class EveResponseError extends Error {
-  constructor(readonly status: number) {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+  ) {
     super(`Eve returned HTTP ${status}`)
     this.name = 'EveResponseError'
   }
+}
+
+function isMissingSessionInputResponseFailure(error: unknown): error is EveResponseError {
+  if (!(error instanceof EveResponseError)) return false
+  const body = error.body.toLowerCase()
+  return (
+    body.includes('"error":"input_session_not_found"') ||
+    (body.includes('cannot deliver inputresponses') &&
+      body.includes('target session was not found') &&
+      body.includes('continuation token'))
+  )
+}
+
+async function boundedResponseText(response: Response): Promise<string> {
+  if (!response.body) return ''
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (total < MAX_EVE_ERROR_BODY_BYTES) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const remaining = MAX_EVE_ERROR_BODY_BYTES - total
+      const chunk = value.byteLength > remaining ? value.subarray(0, remaining) : value
+      chunks.push(chunk)
+      total += chunk.byteLength
+      if (chunk.byteLength < value.byteLength) break
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return new TextDecoder().decode(bytes)
 }
 
 function isRaftAuthenticationFailure(error: unknown): error is HttpResponseError {
@@ -280,7 +323,7 @@ class EveClient {
       ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
       signal: AbortSignal.timeout(input.timeoutMs ?? 60_000),
     })
-    if (!response.ok) throw new EveResponseError(response.status)
+    if (!response.ok) throw new EveResponseError(response.status, await boundedResponseText(response))
     return response
   }
 
@@ -546,6 +589,10 @@ export class EveRaftService {
 
   private async processEvent(event: QueuedRaftEvent): Promise<void> {
     this.assertConnected()
+    if (event.pendingInputExpiry) {
+      await this.expirePendingInput(event, event.pendingInputExpiry)
+      return
+    }
     let raw = await this.canonicalPendingInputMessage(event.message)
     const canonicalId = rawMessageId(raw)
     if (canonicalId && canonicalId !== event.id && canonicalId !== event.canonicalId) {
@@ -603,15 +650,30 @@ export class EveRaftService {
       await this.store.checkpointHead(this.queue, event.id, { taskPhase: 'started' })
       taskPhase = 'started'
     }
+    const seenUpToSeq = Math.max(normalized.seq ?? -1, event.freshnessSeenUpToSeq ?? -1)
+    const cursor = seenUpToSeq >= 0 ? seenUpToSeq : undefined
     let dispatch = event.dispatch
     if (!dispatch) {
-      const response = await this.eve.dispatch({
-        protocolVersion: RAFT_CHANNEL_PROTOCOL_VERSION,
-        serverId: this.credential!.serverId,
-        agentId: this.credential!.agentId,
-        agentName: this.credential!.agentName,
-        message: normalized,
-      })
+      let response: RaftDispatchResponse
+      try {
+        response = await this.eve.dispatch({
+          protocolVersion: RAFT_CHANNEL_PROTOCOL_VERSION,
+          serverId: this.credential!.serverId,
+          agentId: this.credential!.agentId,
+          agentName: this.credential!.agentName,
+          message: normalized,
+        })
+      } catch (error) {
+        if (!normalized.inputResponses || !isMissingSessionInputResponseFailure(error)) throw error
+        const pendingInputExpiry: PendingInputExpiry = {
+          target: normalized.replyTarget,
+          replyTarget: normalized.replyTarget,
+          ...(cursor === undefined ? {} : { seenUpToSeq: cursor }),
+        }
+        await this.store.checkpointHead(this.queue, event.id, { pendingInputExpiry })
+        await this.expirePendingInput(event, pendingInputExpiry)
+        return
+      }
       if (!response.accepted) {
         if (effectiveTask) throw new PermanentEventError('assigned_task_ignored')
         return
@@ -627,15 +689,12 @@ export class EveRaftService {
       await this.store.checkpointHead(this.queue, event.id, { dispatch })
     }
     if (normalized.inputResponses) {
-      delete this.pendingInput.byReplyTarget[normalized.replyTarget]
-      await this.store.savePendingInput(this.pendingInput)
+      await this.clearPendingInput(normalized.replyTarget)
     }
 
     const deliveryTask = dispatch.task
     let replyDelivered = event.replyDelivered === true
 
-    const seenUpToSeq = Math.max(normalized.seq ?? -1, event.freshnessSeenUpToSeq ?? -1)
-    const cursor = seenUpToSeq >= 0 ? seenUpToSeq : undefined
     if (!replyDelivered) {
       const stream = await this.eve.stream(dispatch.streamPath, dispatch.streamStartIndex)
       const activityWrites: Array<Promise<void>> = []
@@ -716,6 +775,28 @@ export class EveRaftService {
       return raw
     }
     return this.pendingInput.byReplyTarget[resolvedReplyTarget] ? { ...raw, ...resolved } : raw
+  }
+
+  private async clearPendingInput(replyTarget: string): Promise<void> {
+    if (!this.pendingInput.byReplyTarget[replyTarget]) return
+    const next: PendingInputFile = {
+      schemaVersion: 1,
+      byReplyTarget: { ...this.pendingInput.byReplyTarget },
+    }
+    delete next.byReplyTarget[replyTarget]
+    await this.store.savePendingInput(next)
+    this.pendingInput = next
+  }
+
+  private async expirePendingInput(event: QueuedRaftEvent, expiry: PendingInputExpiry): Promise<void> {
+    await this.clearPendingInput(expiry.replyTarget)
+    await this.raft!.send(
+      expiry.target,
+      'That question expired after the agent restarted. Please ask again.',
+      `eve-raft-expired-input-${hash(event.id)}`,
+      expiry.seenUpToSeq,
+    )
+    await this.markFailure(event.taskAnchor?.messageId ?? event.id)
   }
 
   private async normalizeMessage(

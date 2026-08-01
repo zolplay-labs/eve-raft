@@ -336,6 +336,52 @@ describe('Eve Raft service', () => {
     expect(raft.sent.filter((sent) => sent.content === 'Resumed: two')).toHaveLength(1)
   })
 
+  it('expires a pending answer when Eve lost its session without retrying it as a new turn', async () => {
+    const first = await service()
+    raft.events.push(message({ id: 'expired1-root', message_id: 'expired1-root', content: 'ask me first' }))
+    await first.drain()
+    await first.processNext()
+    eve.expireSessions()
+
+    raft.events.push(
+      message({
+        seq: 2,
+        id: 'expired-answer',
+        message_id: 'expired-answer',
+        channel_type: 'thread',
+        channel_name: 'thread-expired1',
+        parent_channel_type: 'dm',
+        parent_channel_name: 'Dex',
+        content: '1',
+      }),
+    )
+    await first.drain()
+    raft.nextSendFailure = { status: 503, body: { error: 'temporary_failure' } }
+    await expect(first.processNext()).rejects.toThrow()
+
+    const checkpointed = await new StateStore(stateDirectory).loadQueue()
+    expect(checkpointed.events[0]).toMatchObject({
+      id: 'expired-answer',
+      pendingInputExpiry: {
+        target: 'dm:@Dex:expired1',
+        replyTarget: 'dm:@Dex:expired1',
+        seenUpToSeq: 2,
+      },
+    })
+    expect((await new StateStore(stateDirectory).loadPendingInput()).byReplyTarget).toEqual({})
+
+    const restarted = await service()
+    await restarted.processNext()
+
+    expect(eve.inputs).toHaveLength(1)
+    expect(raft.sent.filter((sent) => sent.content.includes('question expired'))).toEqual([
+      expect.objectContaining({ target: 'dm:@Dex:expired1', seenUpToSeq: 2 }),
+    ])
+    expect(raft.sent.map((sent) => sent.content)).not.toContain('Echo: 1')
+    expect(raft.sent.map((sent) => sent.content)).not.toContain('Resumed: one')
+    expect((await new StateStore(stateDirectory).loadQueue()).events).toEqual([])
+  })
+
   it('keeps a wrong-thread answer isolated and applies a duplicate only once', async () => {
     const instance = await service()
     raft.events.push(message({ content: 'ask me first' }))

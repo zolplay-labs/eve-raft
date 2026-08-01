@@ -96,6 +96,16 @@ function fingerprintFromMessage(message: unknown): string | null {
   return firstLine ? (TRANSPORT_MARKER.exec(firstLine)?.[1] ?? null) : null
 }
 
+function isMissingSessionInputResponseError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const message = error.message.toLowerCase()
+  return (
+    message.includes('cannot deliver inputresponses') &&
+    message.includes('target session was not found') &&
+    message.includes('continuation token')
+  )
+}
+
 function attachIdempotentDelivery(channel: ReturnType<typeof defineChannel<RaftChannelState>>): void {
   const adapter = (channel as unknown as { adapter?: MutableRaftAdapter }).adapter
   if (!adapter || typeof adapter.deliver !== 'function') {
@@ -231,22 +241,30 @@ export function createRaftChannel(options: CreateRaftChannelOptions = {}) {
         const auth = options.resolveAuth ? await options.resolveAuth(principal) : defaultRaftAuth(principal)
         const content = raftUserContent(message, markedText(mention.content, fingerprint))
         const payload = message.inputResponses ? { inputResponses: message.inputResponses } : content
-        const session = await send(payload, {
-          auth,
-          continuationToken,
-          mode: 'conversation',
-          state: {
-            serverId: envelope.serverId,
-            agentId: envelope.agentId,
-            target: message.target,
-            replyTarget: message.replyTarget,
-            messageId: message.messageId,
-            lastEventFingerprint: null,
-          },
-          title: taskFor(message)
-            ? `Raft task #${message.taskNumber}`
-            : `${principal.surface === 'direct' ? 'Raft DM' : 'Raft thread'} with @${message.senderName}`,
-        })
+        let session: Session
+        try {
+          session = await send(payload, {
+            auth,
+            continuationToken,
+            mode: 'conversation',
+            state: {
+              serverId: envelope.serverId,
+              agentId: envelope.agentId,
+              target: message.target,
+              replyTarget: message.replyTarget,
+              messageId: message.messageId,
+              lastEventFingerprint: null,
+            },
+            title: taskFor(message)
+              ? `Raft task #${message.taskNumber}`
+              : `${principal.surface === 'direct' ? 'Raft DM' : 'Raft thread'} with @${message.senderName}`,
+          })
+        } catch (error) {
+          if (message.inputResponses && isMissingSessionInputResponseError(error)) {
+            return Response.json({ ok: false, error: 'input_session_not_found' }, { status: 410 })
+          }
+          throw error
+        }
         const response = acceptedResponse(
           envelope,
           session.id,

@@ -50,6 +50,19 @@ async function waitForSentContent(raft: FakeRaftServer, fromIndex: number, expec
   )
 }
 
+async function waitForQueueDepth(origin: string, expected: number): Promise<void> {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    const response = await fetch(new URL('/health', origin))
+    if (response.ok) {
+      const health = (await response.json()) as Record<string, unknown>
+      if (health.queueDepth === expected) return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Packed standalone Eve Raft fixture queue did not reach depth ${expected}`)
+}
+
 describe('packed registry installation', () => {
   it('installs the package through Eve and runs the real root channel', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'eve-raft-pack-'))
@@ -202,23 +215,53 @@ describe('packed registry installation', () => {
       expect(raft.sent).toHaveLength(2)
       expect(raft.sent[1]).toMatchObject({ content: expect.stringContaining('Fixture received exact PNG attachment') })
 
+      raft.events.push({
+        seq: 3,
+        id: 'hitlpack-root',
+        message_id: 'hitlpack-root',
+        timestamp: '2026-07-31T00:00:02.000Z',
+        sender_type: 'human',
+        sender_name: 'cali',
+        channel_type: 'dm',
+        channel_name: raft.agentName,
+        content: 'ask me before restart',
+      })
+      await waitForSentContent(raft, 2, '1) Ship')
+      await waitForQueueDepth(origin, 0)
+
       await stopProcess(eve)
       eve = startFixture()
       expect(await waitForHealth(origin)).toMatchObject({ state: 'connected' })
       raft.events.push({
-        seq: 3,
+        seq: 4,
+        id: 'hitlpack-answer',
+        message_id: 'hitlpack-answer',
+        timestamp: '2026-07-31T00:00:03.000Z',
+        sender_type: 'human',
+        sender_name: 'cali',
+        channel_type: 'thread',
+        channel_name: 'thread-hitlpack',
+        parent_channel_type: 'dm',
+        parent_channel_name: raft.agentName,
+        content: '1',
+      })
+      await waitForSentContent(raft, 3, 'Fixture resumed:')
+      expect(raft.sent.filter((message) => message.content.includes('Fixture resumed:'))).toHaveLength(1)
+
+      raft.events.push({
+        seq: 5,
         id: 'message-after-restart',
         message_id: 'message-after-restart',
-        timestamp: '2026-07-31T00:00:02.000Z',
+        timestamp: '2026-07-31T00:00:04.000Z',
         sender_type: 'human',
         sender_name: 'cali',
         channel_type: 'dm',
         channel_name: raft.agentName,
         content: 'after restart',
       })
-      await waitForSentContent(raft, 2, 'after restart')
-      expect(raft.sent).toHaveLength(3)
-      expect(raft.sent[2]).toMatchObject({ content: expect.stringContaining('after restart') })
+      await waitForSentContent(raft, 4, 'after restart')
+      expect(raft.sent).toHaveLength(5)
+      expect(raft.sent[4]).toMatchObject({ content: expect.stringContaining('after restart') })
     } finally {
       if (eve) await stopProcess(eve)
       await raft.stop()

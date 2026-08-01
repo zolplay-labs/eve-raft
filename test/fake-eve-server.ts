@@ -59,6 +59,11 @@ export class FakeEveServer {
 
   constructor(readonly channelToken: string) {}
 
+  expireSessions(): void {
+    this.sessionsByToken.clear()
+    this.sessionsById.clear()
+  }
+
   async start(): Promise<void> {
     const channel = createRaftChannel({ channelToken: this.channelToken })
     const messageRoute = channel.routes.find(
@@ -82,6 +87,14 @@ export class FakeEveServer {
     const send = async (input: unknown, options: Record<string, unknown>) => {
       const token = String(options.continuationToken)
       let session = this.sessionsByToken.get(token)
+      const inputResponses =
+        input &&
+        typeof input === 'object' &&
+        !Array.isArray(input) &&
+        Array.isArray((input as { inputResponses?: unknown }).inputResponses)
+      if (!session && inputResponses) {
+        throw new Error('Cannot deliver inputResponses — the target session was not found via continuation token.')
+      }
       if (!session) {
         const id = `session-${++this.sequence}`
         const state =

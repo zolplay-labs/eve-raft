@@ -1,5 +1,5 @@
 import { createServer } from 'node:net'
-import { mkdtemp, stat } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -7,6 +7,15 @@ import { describe, expect, it } from 'vitest'
 
 import { assertRuntimeCompatibility, startSupervisedRuntime } from '../src/runtime.ts'
 import { StateStore } from '../src/state.ts'
+
+const root = path.resolve(import.meta.dirname, '..')
+
+async function runtimeWorkspace(prefix: string): Promise<string> {
+  const directory = await mkdtemp(path.join(tmpdir(), prefix))
+  await writeFile(path.join(directory, 'package.json'), '{"private":true}\n')
+  await symlink(path.join(root, 'node_modules'), path.join(directory, 'node_modules'), 'dir')
+  return directory
+}
 
 async function unusedPort(): Promise<number> {
   const server = createServer()
@@ -19,7 +28,10 @@ async function unusedPort(): Promise<number> {
 
 describe('co-located Eve supervisor', () => {
   it('injects private channel settings and exposes redacted liveness while unconfigured', async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-runtime-'))
+    const directory = await runtimeWorkspace('eve-raft-runtime-')
+    const originalWorkflowDirectory = path.join(directory, '.eve', '.workflow-data')
+    await mkdir(originalWorkflowDirectory, { recursive: true })
+    await writeFile(path.join(originalWorkflowDirectory, 'existing-session'), 'preserved')
     const evePort = await unusedPort()
     const childScript = [
       "const http = require('node:http')",
@@ -39,6 +51,7 @@ describe('co-located Eve supervisor', () => {
       eveHost: '127.0.0.1',
       evePort,
       childCommand: [process.execPath, '-e', childScript, '--'],
+      cwd: directory,
     })
 
     try {
@@ -55,6 +68,11 @@ describe('co-located Eve supervisor', () => {
       expect(eveHealth).toMatchObject({ ok: true, tokenInjected: true, address: '127.0.0.1' })
       const store = new StateStore(directory)
       expect((await stat(store.settingsPath)).mode & 0o777).toBe(0o600)
+      expect((await stat(store.workflowDirectory)).mode & 0o777).toBe(0o700)
+      const localWorkflowDirectory = path.join(directory, '.eve', '.workflow-data')
+      expect((await lstat(localWorkflowDirectory)).isSymbolicLink()).toBe(true)
+      expect(await realpath(localWorkflowDirectory)).toBe(await realpath(store.workflowDirectory))
+      expect(await readFile(path.join(store.workflowDirectory, 'existing-session'), 'utf8')).toBe('preserved')
     } finally {
       await runtime.stop()
       await runtime.done
@@ -79,7 +97,7 @@ describe('co-located Eve supervisor', () => {
   })
 
   it.skipIf(process.platform === 'win32')('stops the child process group when a wrapper exits first', async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-runtime-stubborn-'))
+    const directory = await runtimeWorkspace('eve-raft-runtime-stubborn-')
     const evePort = await unusedPort()
     const eveScript = [
       "const http = require('node:http')",
@@ -104,6 +122,7 @@ describe('co-located Eve supervisor', () => {
       childCommand: [process.execPath, '-e', wrapperScript, '--'],
       childShutdownGraceMs: 25,
       childKillWaitMs: 250,
+      cwd: directory,
     })
 
     await runtime.ready

@@ -36,7 +36,7 @@ eve-raft start --data-dir /data -- eve start
 
 `connect` asks for the Raft API origin and external-agent ID when omitted. It prints Raft's device-login URL and code, waits for approval, validates the minted agent credential, and stores it under the data directory. No user-managed secret environment variables are required.
 
-The only environment value consumed by the default runtime is the platform-provided `PORT` for the public health server. Eve runs on a separate loopback port and receives the private channel token from the supervisor process.
+The only user-supplied environment value consumed by the default runtime is the platform-provided `PORT` for the public health server. Eve runs on a separate loopback port and receives its private channel token and persistent workflow-data path from the supervisor process.
 
 ## Create the Raft external agent
 
@@ -59,7 +59,7 @@ The included [Dockerfile](./Dockerfile) builds the standalone fixture and [railw
 
 5. Approve the printed device URL. The running service notices the stored credential without adding an environment variable or rebuilding the image.
 
-The volume owns `credential.json`, `settings.json`, `queue.json`, `pending-events.json`, and `pending-input.json`. Directories use mode `0700`; persisted state files use `0600`.
+The volume owns `credential.json`, `settings.json`, `queue.json`, `pending-events.json`, `pending-input.json`, and Eve's `eve-workflow/` session store. The supervisor always places the local Workflow world inside the selected data directory, so parked human-input turns survive container replacement without another environment variable. Directories use mode `0700`; persisted state files use `0600`.
 
 `GET /health` contains only process liveness, exact Node/Eve/Eve Raft versions, the supported protocol version, the configured server origin, connection state, queue depth, and coarse error codes. It omits raw Raft server, agent, and profile identifiers and never includes credentials, device codes, message content, attachments, prompts, model output, or tool details.
 

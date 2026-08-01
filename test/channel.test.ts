@@ -42,12 +42,15 @@ function request(body: unknown, token = 'channel-secret'): Request {
   })
 }
 
-function routeHarness(options: { existingSessionId?: string } = {}) {
-  const send = vi.fn(async (_message: unknown, sendOptions: { continuationToken: string }) => ({
-    id: options.existingSessionId ?? 'session-1',
-    continuationToken: sendOptions.continuationToken,
-    getStreamTailIndex: vi.fn(async () => 4),
-  }))
+function routeHarness(options: { existingSessionId?: string; sendError?: Error } = {}) {
+  const send = vi.fn(async (_message: unknown, sendOptions: { continuationToken: string }) => {
+    if (options.sendError) throw options.sendError
+    return {
+      id: options.existingSessionId ?? 'session-1',
+      continuationToken: sendOptions.continuationToken,
+      getStreamTailIndex: vi.fn(async () => 4),
+    }
+  })
   const getSession = vi.fn(() => ({
     id: options.existingSessionId ?? 'session-1',
     continuationToken: 'continuation',
@@ -169,6 +172,22 @@ describe('Raft channel', () => {
       { inputResponses },
       expect.objectContaining({ continuationToken: 'server-1:agent-1:dm:@Dex:message' }),
     )
+  })
+
+  it('returns a stable expiry response when pending input lost its Eve session', async () => {
+    const channel = createRaftChannel({ channelToken: 'channel-secret' })
+    const harness = routeHarness({
+      sendError: new Error('Cannot deliver inputResponses — the target session was not found via continuation token.'),
+    })
+    const inputResponses = [{ requestId: 'approval-request', optionId: 'ship' }]
+
+    const response = await messageRoute(channel).handler(
+      request(envelope({ content: '1', inputResponses })),
+      harness.args as never,
+    )
+
+    expect(response.status).toBe(410)
+    expect(await response.json()).toEqual({ ok: false, error: 'input_session_not_found' })
   })
 
   it('ignores the connected agent and rejects callers without the channel token', async () => {

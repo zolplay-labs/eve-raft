@@ -113,6 +113,7 @@ Applications that already own pairing, credentials, attachment storage, or a pri
 ```ts
 import {
   EveRaftService,
+  HttpResponseError,
   RaftClient,
   type EveRaftConnectionSource,
   type EveRaftTransport,
@@ -124,7 +125,7 @@ const connectionSource: EveRaftConnectionSource = {
     return credential ? { identity: credential, client: new RaftClient(credential) } : null
   },
   async rejected(error) {
-    await markCredentialRejected(error.status)
+    if (error instanceof HttpResponseError) await markCredentialRejected(error.status)
   },
 }
 

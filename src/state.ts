@@ -81,6 +81,12 @@ export interface PendingEventsFile {
   events: RawRaftMessage[]
 }
 
+export interface DeliveryStateIdentity {
+  schemaVersion: 1
+  serverId: string
+  agentId: string
+}
+
 const MAX_QUEUE_EVENTS = 1_000
 const MAX_QUEUE_BYTES = 16 * 1024 * 1024
 const MAX_RECENT_EVENT_IDS = 4_096
@@ -244,6 +250,7 @@ export class StateStore {
   readonly queuePath: string
   readonly pendingEventsPath: string
   readonly pendingInputPath: string
+  readonly deliveryIdentityPath: string
   readonly workflowDirectory: string
 
   constructor(directory: string) {
@@ -253,6 +260,7 @@ export class StateStore {
     this.queuePath = path.join(this.directory, 'queue.json')
     this.pendingEventsPath = path.join(this.directory, 'pending-events.json')
     this.pendingInputPath = path.join(this.directory, 'pending-input.json')
+    this.deliveryIdentityPath = path.join(this.directory, 'delivery-identity.json')
     this.workflowDirectory = path.join(this.directory, 'eve-workflow')
   }
 
@@ -339,6 +347,42 @@ export class StateStore {
       throw new Error('Pending Raft event page exceeds its durable bounds')
     }
     await writeJsonAtomic(this.pendingEventsPath, { schemaVersion: 1, events })
+  }
+
+  async loadDeliveryIdentity(): Promise<DeliveryStateIdentity | null> {
+    const value = await readJson(this.deliveryIdentityPath, 64 * 1024)
+    if (value === null) return null
+    if (
+      !isRecord(value) ||
+      value.schemaVersion !== 1 ||
+      !boundedString(value.serverId, 200) ||
+      !boundedString(value.agentId, 200)
+    ) {
+      throw new Error('Stored Raft delivery identity is invalid')
+    }
+    return value as unknown as DeliveryStateIdentity
+  }
+
+  async saveDeliveryIdentity(identity: DeliveryStateIdentity): Promise<void> {
+    if (
+      identity.schemaVersion !== 1 ||
+      !boundedString(identity.serverId, 200) ||
+      !boundedString(identity.agentId, 200)
+    ) {
+      throw new Error('Raft delivery identity is invalid')
+    }
+    await writeJsonAtomic(this.deliveryIdentityPath, identity)
+  }
+
+  async rebindEmptyDeliveryState(queue: QueueFile, identity: DeliveryStateIdentity): Promise<void> {
+    if (queue.events.length > 0) throw new Error('Cannot rebind non-empty Raft delivery state')
+    queue.recentEventIds = []
+    await Promise.all([
+      writeJsonAtomic(this.queuePath, queue),
+      writeJsonAtomic(this.pendingEventsPath, { schemaVersion: 1, events: [] }),
+      writeJsonAtomic(this.pendingInputPath, { schemaVersion: 1, byReplyTarget: {} }),
+    ])
+    await this.saveDeliveryIdentity(identity)
   }
 
   async appendEvents(

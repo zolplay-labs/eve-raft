@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { attachmentMatchesMediaType, stripRaftTransportMarkers } from './protocol.js'
 import { HttpResponseError, RaftClient, RaftFreshnessHoldError, type RaftProfile } from './raft-client.js'
 import {
+  type DeliveryStateIdentity,
   type PendingInputExpiry,
   type PendingInputFile,
   type QueueFile,
@@ -451,6 +452,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   private queue: QueueFile = { schemaVersion: 1, events: [], recentEventIds: [] }
   private pendingEvents: RawRaftMessage[] = []
   private pendingInput: PendingInputFile = { schemaVersion: 1, byReplyTarget: {} }
+  private deliveryIdentity: DeliveryStateIdentity | null = null
   private profileCache = new Map<string, RaftProfile>()
   private initialized = false
 
@@ -475,9 +477,16 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   private async initializeUnlocked(): Promise<void> {
     if (this.initialized) return
     await this.store.initialize()
-    this.queue = await this.store.loadQueue()
-    this.pendingEvents = (await this.store.loadPendingEvents()).events
-    this.pendingInput = await this.store.loadPendingInput()
+    const [queue, pendingEvents, pendingInput, deliveryIdentity] = await Promise.all([
+      this.store.loadQueue(),
+      this.store.loadPendingEvents(),
+      this.store.loadPendingInput(),
+      this.store.loadDeliveryIdentity(),
+    ])
+    this.queue = queue
+    this.pendingEvents = pendingEvents.events
+    this.pendingInput = pendingInput
+    this.deliveryIdentity = deliveryIdentity
     this.health.queueDepth = this.queue.events.length
     if (!(await this.connectStoredCredential())) {
       if (this.health.state === 'starting') this.health.state = 'unconfigured'
@@ -496,7 +505,11 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     return this.connectionLock.run(async () => {
       this.disconnect('connection_reloading')
       const connected = await this.connectStoredCredential()
-      if (!connected && this.health.lastError !== 'credential_rejected') {
+      if (
+        !connected &&
+        this.health.lastError !== 'credential_rejected' &&
+        this.health.lastError !== 'connection_identity_conflict'
+      ) {
         this.health.state = 'unconfigured'
         this.health.serverUrl = null
         this.health.lastError = null
@@ -514,7 +527,12 @@ export class EveRaftService<TAttachment = RaftAttachment> {
           try {
             if (this.health.state !== 'connected') {
               if (this.health.state !== 'error') await this.connectStoredCredential()
-              return { preserveError: this.health.lastError === 'credential_rejected', processed: false }
+              return {
+                preserveError:
+                  this.health.lastError === 'credential_rejected' ||
+                  this.health.lastError === 'connection_identity_conflict',
+                processed: false,
+              }
             }
             if (this.queue.events.length === 0) await this.drainUnlocked()
             return { preserveError: false, processed: await this.processNextUnlocked() }
@@ -694,6 +712,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       await this.rejectConnection(error)
       return false
     }
+    if (!(await this.bindDeliveryIdentity(identity))) return false
     this.credential = { ...identity, agentName: profile.name }
     this.raft = raft
     this.health.state = 'connected'
@@ -711,8 +730,41 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   }
 
   private async rejectConnection(error: Error): Promise<void> {
-    await this.connectionSource?.rejected?.(error)
     this.disconnect('credential_rejected')
+    try {
+      await this.connectionSource?.rejected?.(error)
+    } catch {
+      this.health.lastError = 'credential_rejected'
+    }
+  }
+
+  private async bindDeliveryIdentity(identity: EveRaftConnectionIdentity): Promise<boolean> {
+    const next: DeliveryStateIdentity = {
+      schemaVersion: 1,
+      serverId: identity.serverId,
+      agentId: identity.agentId,
+    }
+    if (!this.deliveryIdentity) {
+      await this.store.saveDeliveryIdentity(next)
+      this.deliveryIdentity = next
+      return true
+    }
+    if (this.deliveryIdentity.serverId === next.serverId && this.deliveryIdentity.agentId === next.agentId) {
+      return true
+    }
+    if (
+      this.queue.events.length > 0 ||
+      this.pendingEvents.length > 0 ||
+      Object.keys(this.pendingInput.byReplyTarget).length > 0
+    ) {
+      this.disconnect('connection_identity_conflict')
+      return false
+    }
+    await this.store.rebindEmptyDeliveryState(this.queue, next)
+    this.pendingEvents = []
+    this.pendingInput = { schemaVersion: 1, byReplyTarget: {} }
+    this.deliveryIdentity = next
+    return true
   }
 
   private async processEvent(event: QueuedRaftEvent): Promise<void> {

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { RaftClient } from '../src/raft-client.ts'
 import { EveRaftService, type EveRaftConnectionSource, type EveRaftTransport } from '../src/service.ts'
+import type { RaftCredential } from '../src/state.ts'
 import type { RaftAttachmentMediaType, RaftEventEnvelope } from '../src/types.ts'
 import { FakeRaftServer } from './fake-raft-server.ts'
 
@@ -28,6 +29,21 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
   if (!predicate()) throw new Error('Timed out waiting for consumer runtime state')
 }
 
+function credentialFor(server: FakeRaftServer, overrides: Partial<RaftCredential> = {}): RaftCredential {
+  return {
+    schemaVersion: 1,
+    serverUrl: server.origin,
+    agentId: server.agentId,
+    agentName: server.agentName,
+    serverId: server.serverId,
+    credentialId: 'credential-1',
+    scopes: ['agent'],
+    apiKey: server.apiKey,
+    createdAt: '2026-08-01T00:00:00.000Z',
+    ...overrides,
+  }
+}
+
 describe('consumer-owned Eve Raft runtime', () => {
   let raft: FakeRaftServer
 
@@ -40,17 +56,7 @@ describe('consumer-owned Eve Raft runtime', () => {
 
   it('uses consumer transports without storing credentials or attachment bytes', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-'))
-    const credential = {
-      schemaVersion: 1 as const,
-      serverUrl: raft.origin,
-      agentId: raft.agentId,
-      agentName: raft.agentName,
-      serverId: raft.serverId,
-      credentialId: 'credential-1',
-      scopes: ['agent'],
-      apiKey: raft.apiKey,
-      createdAt: '2026-08-01T00:00:00.000Z',
-    }
+    const credential = credentialFor(raft)
     const connectionSource: EveRaftConnectionSource = {
       load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
     }
@@ -112,17 +118,7 @@ describe('consumer-owned Eve Raft runtime', () => {
 
   it('reloads a connection supplied after the runtime starts', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-reload-'))
-    const credential = {
-      schemaVersion: 1 as const,
-      serverUrl: raft.origin,
-      agentId: raft.agentId,
-      agentName: raft.agentName,
-      serverId: raft.serverId,
-      credentialId: 'credential-1',
-      scopes: ['agent'],
-      apiKey: raft.apiKey,
-      createdAt: '2026-08-01T00:00:00.000Z',
-    }
+    const credential = credentialFor(raft)
     let connection: Awaited<ReturnType<EveRaftConnectionSource['load']>> = null
     const connectionSource: EveRaftConnectionSource = {
       load: vi.fn(async () => connection),
@@ -144,17 +140,7 @@ describe('consumer-owned Eve Raft runtime', () => {
 
   it('waits for an in-flight delivery before reloading the connection', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-serialized-reload-'))
-    const credential = {
-      schemaVersion: 1 as const,
-      serverUrl: raft.origin,
-      agentId: raft.agentId,
-      agentName: raft.agentName,
-      serverId: raft.serverId,
-      credentialId: 'credential-1',
-      scopes: ['agent'],
-      apiKey: raft.apiKey,
-      createdAt: '2026-08-01T00:00:00.000Z',
-    }
+    const credential = credentialFor(raft)
     const connectionSource: EveRaftConnectionSource = {
       load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
     }
@@ -205,19 +191,100 @@ describe('consumer-owned Eve Raft runtime', () => {
     expect(connectionSource.load).toHaveBeenCalledTimes(2)
   })
 
+  it('refuses to mix pending delivery state with a different stable Raft identity', async () => {
+    const otherRaft = new FakeRaftServer('Other', 'agent-2', 'server-2')
+    await otherRaft.start()
+    try {
+      const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-identity-conflict-'))
+      let activeRaft = raft
+      const connectionSource: EveRaftConnectionSource = {
+        load: vi.fn(async () => {
+          const credential = credentialFor(activeRaft)
+          return { identity: credential, client: new RaftClient(credential) }
+        }),
+      }
+      const dispatch = vi.fn(async (_envelope: RaftEventEnvelope) => ({ accepted: false, reason: 'ignored' }) as const)
+      raft.events.push({
+        id: 'message-1',
+        message_id: 'message-1',
+        timestamp: '2026-08-01T00:00:00.000Z',
+        sender_type: 'human',
+        sender_name: 'cali',
+        channel_type: 'dm',
+        channel_name: 'Dex',
+        content: 'hello',
+      })
+      const service = new EveRaftService({
+        stateDirectory,
+        connectionSource,
+        eve: { dispatch, stream: vi.fn() },
+      })
+      await service.initialize()
+      await service.drain()
+
+      activeRaft = otherRaft
+      await expect(service.reloadConnection()).resolves.toBe(false)
+      expect(service.health).toMatchObject({ state: 'disconnected', lastError: 'connection_identity_conflict' })
+      expect(dispatch).not.toHaveBeenCalled()
+
+      activeRaft = raft
+      await expect(service.reloadConnection()).resolves.toBe(true)
+      await expect(service.processNext()).resolves.toBe(true)
+      expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ serverId: raft.serverId }))
+    } finally {
+      await otherRaft.stop()
+    }
+  })
+
+  it('clears the completed-event ledger when switching an idle runtime to a new identity', async () => {
+    const otherRaft = new FakeRaftServer('Other', 'agent-2', 'server-2')
+    await otherRaft.start()
+    try {
+      const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-idle-rebind-'))
+      let activeRaft = raft
+      const connectionSource: EveRaftConnectionSource = {
+        load: vi.fn(async () => {
+          const credential = credentialFor(activeRaft)
+          return { identity: credential, client: new RaftClient(credential) }
+        }),
+      }
+      const dispatch = vi.fn(async (_envelope: RaftEventEnvelope) => ({ accepted: false, reason: 'ignored' }) as const)
+      const event = {
+        id: 'shared-message-id',
+        message_id: 'shared-message-id',
+        timestamp: '2026-08-01T00:00:00.000Z',
+        sender_type: 'human',
+        sender_name: 'cali',
+        channel_type: 'dm',
+        channel_name: 'Dex',
+        content: 'hello',
+      }
+      raft.events.push(event)
+      const service = new EveRaftService({
+        stateDirectory,
+        connectionSource,
+        eve: { dispatch, stream: vi.fn() },
+      })
+      await service.initialize()
+      await service.drain()
+      await service.processNext()
+
+      activeRaft = otherRaft
+      otherRaft.events.push(event)
+      await expect(service.reloadConnection()).resolves.toBe(true)
+      await expect(service.drain()).resolves.toBe(1)
+      await expect(service.processNext()).resolves.toBe(true)
+
+      expect(dispatch).toHaveBeenCalledTimes(2)
+      expect(dispatch.mock.calls[1]?.[0]).toEqual(expect.objectContaining({ serverId: otherRaft.serverId }))
+    } finally {
+      await otherRaft.stop()
+    }
+  })
+
   it('rejects a consumer connection whose stable Raft identity does not match', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-identity-rejected-'))
-    const credential = {
-      schemaVersion: 1 as const,
-      serverUrl: raft.origin,
-      agentId: raft.agentId,
-      agentName: raft.agentName,
-      serverId: raft.serverId,
-      credentialId: 'credential-1',
-      scopes: ['agent'],
-      apiKey: raft.apiKey,
-      createdAt: '2026-08-01T00:00:00.000Z',
-    }
+    const credential = credentialFor(raft)
     const rejected = vi.fn()
     const connectionSource: EveRaftConnectionSource = {
       load: vi.fn(async () => ({
@@ -242,17 +309,7 @@ describe('consumer-owned Eve Raft runtime', () => {
 
   it('notifies the consumer when Raft rejects its active connection', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-rejected-'))
-    const credential = {
-      schemaVersion: 1 as const,
-      serverUrl: raft.origin,
-      agentId: raft.agentId,
-      agentName: raft.agentName,
-      serverId: raft.serverId,
-      credentialId: 'credential-1',
-      scopes: ['agent'],
-      apiKey: raft.apiKey,
-      createdAt: '2026-08-01T00:00:00.000Z',
-    }
+    const credential = credentialFor(raft)
     const rejected = vi.fn()
     const connectionSource: EveRaftConnectionSource = {
       load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
@@ -279,17 +336,7 @@ describe('consumer-owned Eve Raft runtime', () => {
 
   it('notifies the consumer when Raft rejects its connection during startup', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-startup-rejected-'))
-    const credential = {
-      schemaVersion: 1 as const,
-      serverUrl: raft.origin,
-      agentId: raft.agentId,
-      agentName: raft.agentName,
-      serverId: raft.serverId,
-      credentialId: 'credential-1',
-      scopes: ['agent'],
-      apiKey: 'rejected-key',
-      createdAt: '2026-08-01T00:00:00.000Z',
-    }
+    const credential = credentialFor(raft, { apiKey: 'rejected-key' })
     const rejected = vi.fn()
     const connectionSource: EveRaftConnectionSource = {
       load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
@@ -305,6 +352,27 @@ describe('consumer-owned Eve Raft runtime', () => {
 
     expect(rejected).toHaveBeenCalledOnce()
     expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ status: 401 }))
+    expect(service.health).toMatchObject({ state: 'disconnected', lastError: 'credential_rejected' })
+  })
+
+  it('stays disconnected when the consumer rejection callback fails', async () => {
+    const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-rejection-callback-'))
+    const credential = credentialFor(raft, { apiKey: 'rejected-key' })
+    const rejected = vi.fn(async () => {
+      throw new Error('consumer persistence failed')
+    })
+    const service = new EveRaftService({
+      stateDirectory,
+      connectionSource: {
+        load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
+        rejected,
+      },
+      eve: { dispatch: vi.fn(), stream: vi.fn() },
+    })
+
+    await expect(service.initialize()).resolves.toBeUndefined()
+
+    expect(rejected).toHaveBeenCalledOnce()
     expect(service.health).toMatchObject({ state: 'disconnected', lastError: 'credential_rejected' })
   })
 })

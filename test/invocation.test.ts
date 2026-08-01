@@ -114,8 +114,16 @@ describe('shared invocation and system tasks', () => {
     expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
   })
 
-  it('resolves a started-task receipt without task metadata', async () => {
-    raft.addTask({ channel: '#tasks', taskNumber: 7, title: 'Ship it', status: 'in_progress', messageId: 'task-7' })
+  it('resolves a started-task receipt when the agent authored the canonical task', async () => {
+    raft.addTask({
+      channel: '#tasks',
+      taskNumber: 7,
+      title: 'Ship it',
+      status: 'in_progress',
+      messageId: 'task-7',
+      senderName: raft.agentName,
+      senderType: 'agent',
+    })
     raft.events.push(
       shared({
         id: 'receipt-1',

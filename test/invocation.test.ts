@@ -15,7 +15,7 @@ describe('shared invocation and system tasks', () => {
   let service: EveRaftService
 
   beforeEach(async () => {
-    raft = new FakeRaftServer()
+    raft = new FakeRaftServer('My Agent')
     eve = new FakeEveServer('channel-secret')
     await Promise.all([raft.start(), eve.start()])
     const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-invocation-'))
@@ -59,7 +59,7 @@ describe('shared invocation and system tasks', () => {
     await service.processNext()
     expect(eve.inputs).toHaveLength(0)
 
-    raft.events.push(shared({ content: '@Dex please help' }))
+    raft.events.push(shared({ content: `@${raft.agentName} please help` }))
     await service.drain()
     await service.processNext()
     expect(raft.sent.at(-1)).toMatchObject({ target: '#general:abcdefgh', content: 'Echo: please help' })
@@ -102,6 +102,30 @@ describe('shared invocation and system tasks', () => {
         content: '📋 1 new task created: #7 "Ship it"',
       }),
       canonical,
+    )
+
+    await service.drain()
+    await service.processNext()
+
+    expect(raft.sent).toEqual([expect.objectContaining({ target: '#tasks:task-7', content: 'Echo: Ship it' })])
+    expect(raft.reactions).toContainEqual({ messageId: 'task-7', emoji: '✅', operation: 'add' })
+    expect(raft.tasks[0]?.status).toBe('in_review')
+    expect(await service.processNext()).toBe(false)
+    expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
+  })
+
+  it('resolves a started-task receipt without task metadata', async () => {
+    raft.addTask({ channel: '#tasks', taskNumber: 7, title: 'Ship it', status: 'in_progress', messageId: 'task-7' })
+    raft.events.push(
+      shared({
+        id: 'receipt-1',
+        message_id: 'receipt-1',
+        sender_type: 'system',
+        sender_name: 'system',
+        channel_type: 'dm',
+        channel_name: raft.agentName,
+        content: `📌 @${raft.agentName} started task #7 "Ship it"`,
+      }),
     )
 
     await service.drain()

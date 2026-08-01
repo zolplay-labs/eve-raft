@@ -29,7 +29,6 @@ function json(response: import('node:http').ServerResponse, status: number, body
 
 export class FakeRaftServer {
   readonly agentId = 'agent-1'
-  readonly agentName = 'Dex'
   readonly serverId = 'server-1'
   apiKey = 'raft-api-key'
   runtimeAgentId: string | undefined = this.agentId
@@ -52,6 +51,8 @@ export class FakeRaftServer {
   private readonly taskMutationResults = new Map<string, Record<string, unknown>>()
   private server: Server | null = null
   origin = ''
+
+  constructor(readonly agentName = 'Dex') {}
 
   async start(): Promise<void> {
     this.server = createServer((request, response) => void this.handle(request, response))

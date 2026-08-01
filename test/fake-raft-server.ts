@@ -48,6 +48,7 @@ export class FakeRaftServer {
   readonly tasks: TaskRecord[] = []
   readonly taskClaims: Array<{ channel: string; taskNumber: number; operation: 'claim' | 'unclaim' }> = []
   failNextTaskClaimAfterAccept = false
+  missingTaskBoardsReturn404 = false
   deviceApproved = false
   nextSendFailure: { status: number; body: Record<string, unknown> } | null = null
   private readonly taskMutationResults = new Map<string, Record<string, unknown>>()
@@ -246,6 +247,10 @@ export class FakeRaftServer {
     }
     if (request.method === 'GET' && path === '/tasks') {
       const channel = url.searchParams.get('channel')
+      if (this.missingTaskBoardsReturn404 && !this.tasks.some((task) => task.channel === channel)) {
+        json(response, 404, { error: 'Agent or channel not found' })
+        return
+      }
       json(response, 200, {
         tasks: this.tasks
           .filter((task) => task.channel === channel)

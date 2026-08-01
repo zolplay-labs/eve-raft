@@ -114,7 +114,8 @@ describe('shared invocation and system tasks', () => {
     expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
   })
 
-  it('resolves a started-task receipt when the agent authored the canonical task', async () => {
+  it('resolves a production-shaped started-task receipt past inaccessible task boards', async () => {
+    raft.missingTaskBoardsReturn404 = true
     raft.addTask({
       channel: '#tasks',
       taskNumber: 7,
@@ -130,8 +131,8 @@ describe('shared invocation and system tasks', () => {
         message_id: 'receipt-1',
         sender_type: 'system',
         sender_name: 'system',
-        channel_type: 'dm',
-        channel_name: raft.agentName,
+        channel_type: 'channel',
+        channel_name: 'tasks',
         content: `📌 @${raft.agentName} started task #7 "Ship it"`,
       }),
     )

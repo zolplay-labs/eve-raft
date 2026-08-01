@@ -373,6 +373,9 @@ export interface EveRaftHealth {
   startedAt: string
   state: 'starting' | 'unconfigured' | 'connected' | 'disconnected' | 'error'
   serverUrl: string | null
+  serverId: string | null
+  agentId: string | null
+  agentName: string | null
   queueDepth: number
   lastEventAt: string | null
   lastError: string | null
@@ -451,6 +454,9 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     startedAt: new Date().toISOString(),
     state: 'starting',
     serverUrl: null,
+    serverId: null,
+    agentId: null,
+    agentName: null,
     queueDepth: 0,
     lastEventAt: null,
     lastError: null,
@@ -741,6 +747,9 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     this.raft = raft
     this.health.state = 'connected'
     this.health.serverUrl = identity.serverUrl
+    this.health.serverId = identity.serverId
+    this.health.agentId = identity.agentId
+    this.health.agentName = profile.name
     this.health.lastError = null
     return true
   }
@@ -750,6 +759,10 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     this.raft = null
     this.profileCache.clear()
     this.health.state = 'disconnected'
+    this.health.serverUrl = null
+    this.health.serverId = null
+    this.health.agentId = null
+    this.health.agentName = null
     this.health.lastError = lastError
   }
 

@@ -205,7 +205,14 @@ describe('consumer-owned Eve Raft runtime', () => {
     connection = { identity: credential, client: new RaftClient(credential) }
 
     await expect(service.reloadConnection()).resolves.toBe(true)
-    expect(service.health).toMatchObject({ state: 'connected', serverUrl: raft.origin, lastError: null })
+    expect(service.health).toMatchObject({
+      state: 'connected',
+      serverUrl: raft.origin,
+      serverId: raft.serverId,
+      agentId: raft.agentId,
+      agentName: raft.agentName,
+      lastError: null,
+    })
     expect(connectionSource.load).toHaveBeenCalledTimes(2)
   })
 

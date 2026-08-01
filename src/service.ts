@@ -618,6 +618,8 @@ export class EveRaftService {
     const systemTask = rawSenderType(raw) === 'system' ? task : null
     let taskAnchor = event.taskAnchor
     if (systemTask && !taskAnchor) {
+      const systemSenderType = rawSenderType(raw)
+      const systemSenderName = rawSenderName(raw)
       let resolved: { channel: string; messageId: string }
       try {
         resolved = await this.raft!.resolveTaskBoard(systemTask.number, systemTask.title)
@@ -626,7 +628,12 @@ export class EveRaftService {
       }
       const canonical = await this.raft!.resolveMessage(resolved.messageId)
       const target = messageTarget(canonical)
-      raw = { ...raw, ...canonical }
+      raw = {
+        ...raw,
+        ...canonical,
+        ...(systemSenderType ? { sender_type: systemSenderType, senderType: systemSenderType } : {}),
+        ...(systemSenderName ? { sender_name: systemSenderName, senderName: systemSenderName } : {}),
+      }
       taskAnchor = { messageId: resolved.messageId, replyTarget: target.replyTarget, taskChannel: resolved.channel }
       await this.store.checkpointHead(this.queue, event.id, {
         taskAnchor,

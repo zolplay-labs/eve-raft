@@ -13,6 +13,8 @@ interface TaskRecord {
   title: string
   status: string
   messageId: string
+  senderName?: string
+  senderType?: 'human' | 'agent'
 }
 
 async function jsonBody(request: import('node:http').IncomingMessage): Promise<Record<string, unknown>> {
@@ -76,8 +78,8 @@ export class FakeRaftServer {
     this.messages.set(task.messageId, {
       id: task.messageId,
       message_id: task.messageId,
-      sender_name: 'owner',
-      sender_type: 'human',
+      sender_name: task.senderName ?? 'owner',
+      sender_type: task.senderType ?? 'human',
       channel_type: task.channel.startsWith('dm:') ? 'dm' : 'channel',
       channel_name: task.channel.replace(/^#|^dm:@/u, ''),
       content: task.title,
@@ -145,16 +147,19 @@ export class FakeRaftServer {
     const path = url.pathname.slice('/internal/agent-api'.length)
     if (request.method === 'GET' && path === '/profile') {
       const target = url.searchParams.get('target')
+      const targetName = target?.replace(/^@/u, '')
       json(
         response,
         200,
         target
-          ? {
-              kind: 'human',
-              id: target.replace(/^@/u, '') === 'cali' ? 'human-1' : 'human-other',
-              name: target.replace(/^@/u, ''),
-              displayName: 'Cali',
-            }
+          ? targetName === this.agentName
+            ? { kind: 'agent', id: this.agentId, name: this.agentName, displayName: 'Dex' }
+            : {
+                kind: 'human',
+                id: targetName === 'cali' ? 'human-1' : 'human-other',
+                name: targetName,
+                displayName: 'Cali',
+              }
           : { kind: 'agent', id: this.agentId, name: this.agentName, displayName: 'Dex' },
       )
       return

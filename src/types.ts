@@ -100,7 +100,15 @@ export interface CreateRaftChannelOptions {
 }
 
 export type RaftDispatchResponse =
-  | { accepted: false; reason: 'ignored' }
+  | { accepted: false; reason: 'duplicate' | 'ignored' }
+  | {
+      accepted: true
+      kind: 'immediate'
+      target: string
+      messageId: string
+      content: string
+      task?: { channel: string; number: number } | null
+    }
   | {
       accepted: true
       kind: 'session'

@@ -116,6 +116,55 @@ describe('consumer-owned Eve Raft runtime', () => {
     expect(JSON.stringify(envelopes)).not.toContain(PNG_BYTES.toString('base64'))
   })
 
+  it('delivers consumer-owned immediate responses with a stable Raft send key', async () => {
+    const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-immediate-'))
+    const credential = credentialFor(raft)
+    raft.events.push({
+      seq: 4,
+      id: 'link-message',
+      message_id: 'link-message',
+      timestamp: '2026-08-01T00:00:00.000Z',
+      sender_type: 'human',
+      sender_name: 'cali',
+      channel_type: 'dm',
+      channel_name: 'Dex',
+      content: 'link ABCD-EFGH',
+    })
+    const service = new EveRaftService({
+      stateDirectory,
+      connectionSource: {
+        load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
+      },
+      eve: {
+        dispatch: vi.fn(
+          async () =>
+            ({
+              accepted: true,
+              kind: 'immediate',
+              target: 'dm:@cali:link-mes',
+              messageId: 'link-message',
+              content: 'Raft is connected to Cali.',
+              task: null,
+            }) as const,
+        ),
+        stream: vi.fn(),
+      },
+    })
+
+    await service.initialize()
+    await service.drain()
+    await service.processNext()
+
+    expect(raft.sent).toEqual([
+      expect.objectContaining({
+        target: 'dm:@cali:link-mes',
+        content: 'Raft is connected to Cali.',
+        idempotencyKey: expect.stringMatching(/^eve-raft-immediate-[a-f0-9]{64}$/u),
+        seenUpToSeq: 4,
+      }),
+    ])
+  })
+
   it('reloads a connection supplied after the runtime starts', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-reload-'))
     const credential = credentialFor(raft)

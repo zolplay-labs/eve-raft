@@ -869,6 +869,18 @@ export class EveRaftService<TAttachment = RaftAttachment> {
         if (effectiveTask) throw new PermanentEventError('assigned_task_ignored')
         return
       }
+      if (response.kind === 'immediate') {
+        if (effectiveTask) throw new PermanentEventError('assigned_task_immediate')
+        await this.raft!.send(
+          response.target,
+          response.content,
+          `eve-raft-immediate-${hash(`${event.id}:${response.messageId}`)}`,
+          cursor,
+        )
+        await this.bestEffortReaction(reactionMessageId, '✅')
+        await this.bestEffortRemoveReaction(reactionMessageId, '👀')
+        return
+      }
       dispatch = {
         target: response.target,
         messageId: response.messageId,

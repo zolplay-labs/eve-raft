@@ -149,6 +149,7 @@ describe('consumer-owned Eve Raft runtime', () => {
         ),
         stream: vi.fn(),
       },
+      deliveryKey: (input) => `dex-${input.kind}-${input.sourceMessageId}`,
     })
 
     await service.initialize()
@@ -159,7 +160,7 @@ describe('consumer-owned Eve Raft runtime', () => {
       expect.objectContaining({
         target: 'dm:@cali:link-mes',
         content: 'Raft is connected to Cali.',
-        idempotencyKey: expect.stringMatching(/^eve-raft-immediate-[a-f0-9]{64}$/u),
+        idempotencyKey: 'dex-immediate-link-message',
         seenUpToSeq: 4,
       }),
     ])

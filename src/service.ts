@@ -385,7 +385,20 @@ export interface EveRaftServiceOptions<TAttachment = RaftAttachment> {
   connectionSource?: EveRaftConnectionSource
   eve?: EveRaftTransport<TAttachment>
   prepareAttachment?: EveRaftAttachmentPreparer<TAttachment>
+  deliveryKey?: EveRaftDeliveryKeyFactory
 }
+
+export type EveRaftDeliveryKind = 'expired-input' | 'failed' | 'final' | 'hitl' | 'immediate' | 'invalid-input'
+
+export interface EveRaftDeliveryKeyInput {
+  kind: EveRaftDeliveryKind
+  eventId: string
+  sourceMessageId: string
+  turnId?: string
+  requestKey?: string
+}
+
+export type EveRaftDeliveryKeyFactory = (input: EveRaftDeliveryKeyInput) => string
 
 export interface EveRaftConnectionIdentity {
   serverUrl: string
@@ -446,6 +459,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   private readonly eve: EveRaftTransport<TAttachment>
   private readonly connectionSource: EveRaftConnectionSource | null
   private readonly prepareAttachment: EveRaftAttachmentPreparer<TAttachment>
+  private readonly deliveryKeyFactory: EveRaftDeliveryKeyFactory | null
   private readonly connectionLock = new AsyncLock()
   private credential: EveRaftConnectionIdentity | null = null
   private raft: RaftClient | null = null
@@ -468,6 +482,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     }
     this.connectionSource = options.connectionSource ?? null
     this.prepareAttachment = options.prepareAttachment ?? (inlineAttachment as EveRaftAttachmentPreparer<TAttachment>)
+    this.deliveryKeyFactory = options.deliveryKey ?? null
   }
 
   async initialize(): Promise<void> {
@@ -599,7 +614,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
         await this.raft!.send(
           error.target,
           `Please answer the pending question with an option number or label.\n\n${error.prompt}`,
-          `eve-raft-invalid-input-${hash(event.id)}`,
+          this.deliveryKey({ kind: 'invalid-input', eventId: event.id, sourceMessageId: event.id }),
           error.seenUpToSeq,
         )
         await this.store.shiftEvent(this.queue, event.id)
@@ -874,7 +889,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
         await this.raft!.send(
           response.target,
           response.content,
-          `eve-raft-immediate-${hash(`${event.id}:${response.messageId}`)}`,
+          this.deliveryKey({ kind: 'immediate', eventId: event.id, sourceMessageId: response.messageId }),
           cursor,
         )
         await this.bestEffortReaction(reactionMessageId, '✅')
@@ -913,6 +928,14 @@ export class EveRaftService<TAttachment = RaftAttachment> {
           this.pendingInput.byReplyTarget[target] = requests
           await this.store.savePendingInput(this.pendingInput)
         },
+        deliveryKey: ({ kind, turnId, requestKey }) =>
+          this.deliveryKey({
+            kind,
+            eventId: event.id,
+            sourceMessageId: dispatch.messageId,
+            turnId,
+            requestKey,
+          }),
       })
       await Promise.all(activityWrites)
       if (outcome.kind === 'waiting') return
@@ -920,7 +943,12 @@ export class EveRaftService<TAttachment = RaftAttachment> {
         await this.raft!.send(
           dispatch.target,
           'The Eve agent could not complete that request. Please try again.',
-          `eve-raft-failed-${hash(`${event.id}:${outcome.turnId}`)}`,
+          this.deliveryKey({
+            kind: 'failed',
+            eventId: event.id,
+            sourceMessageId: dispatch.messageId,
+            turnId: outcome.turnId,
+          }),
           cursor,
         )
         if (deliveryTask && taskPhase === 'started')
@@ -931,7 +959,17 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       if (deliveryTask && !outcome.message) throw new PermanentEventError('task_result_missing')
       if (outcome.message) {
         const reply = stripRaftTransportMarkers(outcome.message)
-        await this.raft!.send(dispatch.target, reply, `eve-raft-final-${hash(`${event.id}:${outcome.turnId}`)}`, cursor)
+        await this.raft!.send(
+          dispatch.target,
+          reply,
+          this.deliveryKey({
+            kind: 'final',
+            eventId: event.id,
+            sourceMessageId: dispatch.messageId,
+            turnId: outcome.turnId,
+          }),
+          cursor,
+        )
       }
       await this.store.checkpointHead(this.queue, event.id, {
         replyDelivered: true,
@@ -996,10 +1034,33 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     await this.raft!.send(
       expiry.target,
       'That question expired after the agent restarted. Please ask again.',
-      `eve-raft-expired-input-${hash(event.id)}`,
+      this.deliveryKey({ kind: 'expired-input', eventId: event.id, sourceMessageId: event.id }),
       expiry.seenUpToSeq,
     )
     await this.markFailure(event.taskAnchor?.messageId ?? event.id)
+  }
+
+  private deliveryKey(input: EveRaftDeliveryKeyInput): string {
+    const custom = this.deliveryKeyFactory?.(input)
+    const value = custom ?? this.defaultDeliveryKey(input)
+    if (value.length === 0 || value.length > 240) throw new Error('Eve Raft delivery key is invalid')
+    return value
+  }
+
+  private defaultDeliveryKey(input: EveRaftDeliveryKeyInput): string {
+    switch (input.kind) {
+      case 'expired-input':
+        return `eve-raft-expired-input-${hash(input.eventId)}`
+      case 'invalid-input':
+        return `eve-raft-invalid-input-${hash(input.eventId)}`
+      case 'immediate':
+        return `eve-raft-immediate-${hash(`${input.eventId}:${input.sourceMessageId}`)}`
+      case 'hitl':
+        return `eve-raft-hitl-${hash(`${input.sourceMessageId}:${input.turnId}:${input.requestKey}`)}`
+      case 'failed':
+      case 'final':
+        return `eve-raft-${input.kind}-${hash(`${input.eventId}:${input.turnId}`)}`
+    }
   }
 
   private async normalizeMessage(

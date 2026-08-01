@@ -93,6 +93,7 @@ interface StreamDelivery {
   send: (target: string, content: string, idempotencyKey: string) => Promise<unknown>
   activity?: (events: RaftActivityEvent[]) => void
   pendingInput?: (target: string, requests: PendingInputRequest[]) => Promise<void>
+  deliveryKey?: (input: { kind: 'hitl'; turnId: string; requestKey: string }) => string
 }
 
 export async function consumeEveStream(response: Response, delivery: StreamDelivery): Promise<StreamOutcome> {
@@ -131,7 +132,8 @@ export async function consumeEveStream(response: Response, delivery: StreamDeliv
         await delivery.send(
           delivery.target,
           prompt.content,
-          `eve-raft-hitl-${hash(`${delivery.sourceMessageId}:${turnId}:${prompt.requestKey}`)}`,
+          delivery.deliveryKey?.({ kind: 'hitl', turnId, requestKey: prompt.requestKey }) ??
+            `eve-raft-hitl-${hash(`${delivery.sourceMessageId}:${turnId}:${prompt.requestKey}`)}`,
         )
       }
     } else if (type === 'turn.completed') {

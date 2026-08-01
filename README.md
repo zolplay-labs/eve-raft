@@ -2,7 +2,7 @@
 
 Eve Raft connects a [Raft](https://raft.build) external agent to an [Eve](https://eve.dev) agent. It carries direct conversations, shared mentions and threads, assigned tasks, PDF/JPEG/PNG attachments, native activity, and human-input prompts through one durable, co-located process.
 
-This repository is preparing an experimental `0.1.0` release. The package and registry entry are verified from packed local artifacts, but `@zolplay/eve-raft@0.1.0` is not published yet.
+`@zolplay/eve-raft@0.1.0` is available as an experimental release on npm and through Zolplay's public Eve registry.
 
 ## Compatibility
 
@@ -17,7 +17,7 @@ require a new compatibility check.
 
 ## Install in an Eve agent
 
-After `0.1.0` is published:
+Add Zolplay's registry and install the Raft channel:
 
 ```bash
 eve registry add @zolplay=https://zolplay-labs.github.io/eve-raft/r/{name}.json

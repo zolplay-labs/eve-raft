@@ -339,7 +339,13 @@ export class RaftClient {
     if (candidates.length > 100) throw new Error('Raft exposed too many task boards to resolve safely')
     const matches: Array<{ channel: string; messageId: string }> = []
     for (const channel of [...new Set(candidates)]) {
-      const tasks = await this.tasks(channel)
+      let tasks: TaskEnvelope[]
+      try {
+        tasks = await this.tasks(channel)
+      } catch (error) {
+        if (error instanceof HttpResponseError && error.status === 404) continue
+        throw error
+      }
       for (const task of tasks) {
         if (
           task.taskNumber === taskNumber &&

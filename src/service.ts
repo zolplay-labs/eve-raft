@@ -317,7 +317,7 @@ class InvalidPendingInputError extends Error {
   }
 }
 
-class EveClient {
+class EveClient implements EveRaftTransport<RaftAttachment> {
   constructor(
     readonly origin: string,
     private readonly channelToken: string,
@@ -359,13 +359,60 @@ export interface EveRaftHealth {
   lastError: string | null
 }
 
-export interface EveRaftServiceOptions {
+export interface EveRaftServiceOptions<TAttachment = RaftAttachment> {
   stateDirectory: string
-  eveOrigin: string
-  channelToken: string
+  eveOrigin?: string
+  channelToken?: string
+  connectionSource?: EveRaftConnectionSource
+  eve?: EveRaftTransport<TAttachment>
+  prepareAttachment?: EveRaftAttachmentPreparer<TAttachment>
 }
 
-export class EveRaftService {
+export interface EveRaftConnectionIdentity {
+  serverUrl: string
+  serverId: string
+  agentId: string
+  agentName: string
+}
+
+export interface EveRaftConnection {
+  identity: EveRaftConnectionIdentity
+  client: RaftClient
+}
+
+export interface EveRaftConnectionSource {
+  load(): EveRaftConnection | null | Promise<EveRaftConnection | null>
+  rejected?(error: HttpResponseError): void | Promise<void>
+}
+
+export interface EveRaftTransport<TAttachment = RaftAttachment> {
+  dispatch(envelope: RaftEventEnvelope<TAttachment>): Promise<RaftDispatchResponse>
+  stream(path: string, startIndex: number): Promise<Response>
+}
+
+export interface EveRaftAttachmentInput {
+  messageId: string
+  id: string
+  fileName: string
+  mediaType: RaftAttachmentMediaType
+  bytes: Uint8Array
+}
+
+export type EveRaftAttachmentPreparer<TAttachment = RaftAttachment> = (
+  input: EveRaftAttachmentInput,
+) => TAttachment | Promise<TAttachment>
+
+function inlineAttachment(input: EveRaftAttachmentInput): RaftAttachment {
+  return {
+    id: input.id,
+    fileName: input.fileName,
+    mediaType: input.mediaType,
+    sizeBytes: input.bytes.byteLength,
+    data: Buffer.from(input.bytes).toString('base64'),
+  }
+}
+
+export class EveRaftService<TAttachment = RaftAttachment> {
   readonly health: EveRaftHealth = {
     protocolVersion: RAFT_CHANNEL_PROTOCOL_VERSION,
     startedAt: new Date().toISOString(),
@@ -377,8 +424,10 @@ export class EveRaftService {
   }
 
   private readonly store: StateStore
-  private readonly eve: EveClient
-  private credential: RaftCredential | null = null
+  private readonly eve: EveRaftTransport<TAttachment>
+  private readonly connectionSource: EveRaftConnectionSource | null
+  private readonly prepareAttachment: EveRaftAttachmentPreparer<TAttachment>
+  private credential: EveRaftConnectionIdentity | null = null
   private raft: RaftClient | null = null
   private queue: QueueFile = { schemaVersion: 1, events: [], recentEventIds: [] }
   private pendingEvents: RawRaftMessage[] = []
@@ -386,9 +435,18 @@ export class EveRaftService {
   private profileCache = new Map<string, RaftProfile>()
   private initialized = false
 
-  constructor(options: EveRaftServiceOptions) {
+  constructor(options: EveRaftServiceOptions<TAttachment>) {
     this.store = new StateStore(options.stateDirectory)
-    this.eve = new EveClient(options.eveOrigin, options.channelToken)
+    if (options.eve) {
+      this.eve = options.eve
+    } else {
+      if (!options.eveOrigin || !options.channelToken) {
+        throw new Error('eveOrigin and channelToken are required when no consumer Eve transport is provided')
+      }
+      this.eve = new EveClient(options.eveOrigin, options.channelToken) as EveRaftTransport<TAttachment>
+    }
+    this.connectionSource = options.connectionSource ?? null
+    this.prepareAttachment = options.prepareAttachment ?? (inlineAttachment as EveRaftAttachmentPreparer<TAttachment>)
   }
 
   async initialize(): Promise<void> {
@@ -411,6 +469,17 @@ export class EveRaftService {
     this.health.lastError = 'fatal_runtime_failure'
   }
 
+  async reloadConnection(): Promise<boolean> {
+    this.disconnect('connection_reloading')
+    const connected = await this.connectStoredCredential()
+    if (!connected) {
+      this.health.state = 'unconfigured'
+      this.health.serverUrl = null
+      this.health.lastError = null
+    }
+    return connected
+  }
+
   async run(signal: AbortSignal): Promise<void> {
     await this.initialize()
     let failures = 0
@@ -428,6 +497,7 @@ export class EveRaftService {
         if (!processed) await delay(EVENT_POLL_MS, signal)
       } catch (error) {
         if (isRaftAuthenticationFailure(error)) {
+          await this.connectionSource?.rejected?.(error)
           this.disconnect('credential_rejected')
           failures = 0
           await delay(EVENT_POLL_MS, signal)
@@ -559,17 +629,22 @@ export class EveRaftService {
   }
 
   private async connectStoredCredential(): Promise<boolean> {
-    const credential = await this.store.loadCredential()
-    if (!credential) return false
-    const raft = new RaftClient(credential)
+    const connection = this.connectionSource
+      ? await this.connectionSource.load()
+      : await this.store
+          .loadCredential()
+          .then((credential) => (credential ? { identity: credential, client: new RaftClient(credential) } : null))
+    if (!connection) return false
+    const { client: raft, identity } = connection
     let profile: RaftProfile
     let server: Awaited<ReturnType<RaftClient['serverInfo']>>
     try {
-      const identity = await Promise.all([raft.profile(), raft.serverInfo()])
-      profile = identity[0]
-      server = identity[1]
+      const resolved = await Promise.all([raft.profile(), raft.serverInfo()])
+      profile = resolved[0]
+      server = resolved[1]
     } catch (error) {
       if (isRaftAuthenticationFailure(error)) {
+        await this.connectionSource?.rejected?.(error)
         this.disconnect('credential_rejected')
         return false
       }
@@ -577,16 +652,16 @@ export class EveRaftService {
     }
     if (
       profile.kind !== 'agent' ||
-      profile.id !== credential.agentId ||
-      server.runtimeContext?.agentId !== credential.agentId ||
-      server.runtimeContext.serverId !== credential.serverId
+      profile.id !== identity.agentId ||
+      server.runtimeContext?.agentId !== identity.agentId ||
+      server.runtimeContext.serverId !== identity.serverId
     ) {
       throw new Error('Stored Raft credential does not match the configured agent and server')
     }
-    this.credential = credential
+    this.credential = { ...identity, agentName: profile.name }
     this.raft = raft
     this.health.state = 'connected'
-    this.health.serverUrl = credential.serverUrl
+    this.health.serverUrl = identity.serverUrl
     this.health.lastError = null
     return true
   }
@@ -830,7 +905,7 @@ export class EveRaftService {
       this.credential!.agentId,
       this.credential!.agentName,
     ),
-  ): Promise<RaftMessage> {
+  ): Promise<RaftMessage<TAttachment>> {
     const rawId = rawMessageId(raw)
     const senderName = rawSenderName(raw)
     const channelType = boundedString(raw.channel_type ?? raw.channelType, 100)
@@ -921,13 +996,13 @@ export class EveRaftService {
     }
   }
 
-  private async attachments(raw: RawRaftMessage): Promise<RaftAttachment[]> {
+  private async attachments(raw: RawRaftMessage): Promise<TAttachment[]> {
     const values = raw.attachments
     if (values === undefined) return []
     if (!Array.isArray(values) || values.length > RAFT_ATTACHMENTS_MAX_COUNT) {
       throw new PermanentEventError('attachment_count_exceeded')
     }
-    const attachments: RaftAttachment[] = []
+    const attachments: TAttachment[] = []
     let total = 0
     for (const value of values) {
       if (!value || typeof value !== 'object') throw new PermanentEventError('attachment_metadata_invalid')
@@ -949,13 +1024,15 @@ export class EveRaftService {
       if (total > RAFT_ATTACHMENTS_MAX_TOTAL_BYTES) throw new PermanentEventError('attachment_total_exceeded')
       const mediaType = mediaTypeFor(bytes, response.headers.get('content-type'))
       if (!mediaType) throw new PermanentEventError('attachment_type_unsupported')
-      attachments.push({
-        id: safeIdentifier(id, 'attachment'),
-        fileName: safeFileName(fileName),
-        mediaType,
-        sizeBytes: bytes.byteLength,
-        data: Buffer.from(bytes).toString('base64'),
-      })
+      attachments.push(
+        await this.prepareAttachment({
+          messageId: safeIdentifier(rawMessageId(raw) ?? 'message', 'message'),
+          id: safeIdentifier(id, 'attachment'),
+          fileName: safeFileName(fileName),
+          mediaType,
+          bytes,
+        }),
+      )
     }
     return attachments
   }

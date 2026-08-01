@@ -92,7 +92,7 @@ describe('packed registry installation', () => {
       name?: unknown
       version?: unknown
     }
-    expect(packedManifest).toMatchObject({ name: '@zolplay/eve-raft', version: '0.1.0' })
+    expect(packedManifest).toMatchObject({ name: '@zolplay/eve-raft', version: '0.2.0' })
 
     const fixturePackage = {
       name: 'eve-raft-packed-fixture',
@@ -138,6 +138,16 @@ describe('packed registry installation', () => {
       expect(await readFile(path.join(fixtureDirectory, 'agent/channels/raft.ts'), 'utf8')).toContain(
         "from '@zolplay/eve-raft/channel'",
       )
+      const consumerImport = await execFile(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          "const api = await import('@zolplay/eve-raft/consumer'); console.log(typeof api.EveRaftService)",
+        ],
+        { cwd: fixtureDirectory },
+      )
+      expect(consumerImport.stdout.trim()).toBe('function')
       await execFile('pnpm', ['exec', 'eve', 'build', '--skip-sandbox-prewarm'], {
         cwd: fixtureDirectory,
         env: { ...process.env, EVE_RAFT_CHANNEL_TOKEN: 'packed-channel-token' },

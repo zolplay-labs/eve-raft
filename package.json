@@ -1,6 +1,6 @@
 {
   "name": "@zolplay/eve-raft",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Raft channel integration for Eve agents",
   "keywords": [
     "eve",
@@ -47,6 +47,10 @@
       "types": "./dist/channel.d.ts",
       "import": "./dist/channel.js"
     },
+    "./consumer": {
+      "types": "./dist/consumer.d.ts",
+      "import": "./dist/consumer.js"
+    },
     "./package.json": "./package.json"
   },
   "peerDependencies": {
@@ -63,7 +67,7 @@
   "devDependencies": {
     "@types/node": "24.x",
     "ai": "^7.0.38",
-    "eve": "0.29.2",
+    "eve": "0.29.4",
     "just-bash": "3.1.0",
     "prettier": "^3.6.2",
     "typescript": "7.0.2",

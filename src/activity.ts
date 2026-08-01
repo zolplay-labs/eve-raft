@@ -5,7 +5,7 @@ import type { RaftActivityEvent, RaftActivityHookEventName } from './types.js'
 export interface EveStreamEvent {
   type?: unknown
   data?: Record<string, unknown>
-  meta?: { at?: unknown }
+  meta?: { id?: unknown; at?: unknown }
 }
 
 const IDENTIFIER = /^[A-Za-z0-9_-]{1,160}$/u
@@ -23,9 +23,13 @@ function safeIdentifier(value: string, prefix: string): string {
   return IDENTIFIER.test(value) ? value : `${prefix}_${hash(value).slice(0, 32)}`
 }
 
-function occurredAt(event: EveStreamEvent): string {
+function eventTime(event: EveStreamEvent): { occurredAt: string; fingerprint: string } {
   const value = event.meta?.at
-  return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : new Date().toISOString()
+  if (typeof value === 'string' && Number.isFinite(Date.parse(value))) {
+    return { occurredAt: value, fingerprint: value }
+  }
+  const eventId = boundedString(event.meta?.id, 200)
+  return { occurredAt: new Date().toISOString(), fingerprint: eventId ?? 'untimestamped' }
 }
 
 function toolName(value: unknown): string | null {
@@ -88,16 +92,16 @@ function activity(input: {
   discriminator: string
   toolName?: string
 }): RaftActivityEvent {
-  const at = occurredAt(input.event)
+  const time = eventTime(input.event)
   return {
     schema: 'raft-activity.v1',
     eventId: `eve_raft_${hash(
-      `${input.sourceMessageId}:${input.sessionId}:${input.hookEventName}:${input.discriminator}:${at}`,
+      `${input.sourceMessageId}:${input.sessionId}:${input.hookEventName}:${input.discriminator}:${time.fingerprint}`,
     )}`,
     sessionId: safeIdentifier(input.sessionId, 'session'),
     hookEventName: input.hookEventName,
     status: input.status,
-    occurredAt: at,
+    occurredAt: time.occurredAt,
     ...(input.toolName ? { toolName: input.toolName } : {}),
   }
 }
@@ -151,6 +155,18 @@ export function activityEventsForEveEvent(
         status: failed ? 'error' : 'ok',
         discriminator: `${turnId}:${result.callId}`,
         toolName: result.toolName,
+      }),
+    ]
+  }
+  if (type === 'compaction.requested' || type === 'compaction.completed') {
+    return [
+      activity({
+        ...input,
+        event,
+        hookEventName: type === 'compaction.requested' ? 'PreToolUse' : 'PostToolUse',
+        status: 'ok',
+        discriminator: `${turnId}:context.compaction`,
+        toolName: 'context.compaction',
       }),
     ]
   }

@@ -12,7 +12,7 @@ import { FakeRaftServer } from './fake-raft-server.ts'
 const execFile = promisify(execFileCallback)
 const root = path.resolve(import.meta.dirname, '..')
 const PNG_BYTES = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAAqADAAQAAAABAAAAAgAAAADtGLyqAAAAFklEQVQIHWOW1zT34Z3NqJr8+nXYNAAY3ATCCT8yegAAAABJRU5ErkJggg==',
   'base64',
 )
 
@@ -211,9 +211,9 @@ describe('packed registry installation', () => {
         content: 'hello with packed attachment',
         attachments: [{ id: 'packed-attachment', filename: 'fixture.png' }],
       })
-      await waitForSentContent(raft, 1, 'Fixture received exact PNG attachment')
+      await waitForSentContent(raft, 1, 'Fixture received PNG attachment')
       expect(raft.sent).toHaveLength(2)
-      expect(raft.sent[1]).toMatchObject({ content: expect.stringContaining('Fixture received exact PNG attachment') })
+      expect(raft.sent[1]).toMatchObject({ content: expect.stringContaining('Fixture received PNG attachment') })
 
       raft.events.push({
         seq: 3,

@@ -95,7 +95,7 @@ function rawTaskNotice(message: RawRaftMessage): { number: number; title: string
   const content = boundedString(message.content ?? '', 100_000, true)
   if (content === null) return null
   const created = /^📋 1 new task created: #([1-9]\d*) "((?:[^"\\\r\n]|\\.)+)"$/u.exec(content)
-  const started = /^📌 @([^\s@]{1,160}) started task #([1-9]\d*) "((?:[^"\\\r\n]|\\.)+)"$/u.exec(content)
+  const started = /^📌 @([^@\r\n]{1,160}?) started task #([1-9]\d*) "((?:[^"\\\r\n]|\\.)+)"$/u.exec(content)
   const match = created ?? started
   if (!match) return null
   const number = Number(match[started ? 2 : 1])

@@ -15,7 +15,7 @@ describe('shared invocation and system tasks', () => {
   let service: EveRaftService
 
   beforeEach(async () => {
-    raft = new FakeRaftServer()
+    raft = new FakeRaftServer('My Agent')
     eve = new FakeEveServer('channel-secret')
     await Promise.all([raft.start(), eve.start()])
     const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-invocation-'))
@@ -59,7 +59,7 @@ describe('shared invocation and system tasks', () => {
     await service.processNext()
     expect(eve.inputs).toHaveLength(0)
 
-    raft.events.push(shared({ content: '@Dex please help' }))
+    raft.events.push(shared({ content: `@${raft.agentName} please help` }))
     await service.drain()
     await service.processNext()
     expect(raft.sent.at(-1)).toMatchObject({ target: '#general:abcdefgh', content: 'Echo: please help' })
@@ -124,7 +124,7 @@ describe('shared invocation and system tasks', () => {
         sender_name: 'system',
         channel_type: 'dm',
         channel_name: raft.agentName,
-        content: '📌 @Dex started task #7 "Ship it"',
+        content: `📌 @${raft.agentName} started task #7 "Ship it"`,
       }),
     )
 

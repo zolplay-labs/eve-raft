@@ -7,6 +7,25 @@ import { describe, expect, it } from 'vitest'
 import { StateStore } from '../src/state.ts'
 
 describe('persistent state', () => {
+  it('loads and advances a legacy queue without a recent-event ledger', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-legacy-queue-'))
+    const store = new StateStore(directory)
+    await store.initialize()
+    await writeFile(
+      store.queuePath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        events: [{ id: 'legacy-message', receivedAt: '2026-07-31T00:00:00.000Z', message: { id: 'legacy-message' } }],
+      })}\n`,
+    )
+
+    const queue = await store.loadQueue()
+    expect(queue.recentEventIds).toEqual([])
+    await store.shiftEvent(queue, 'legacy-message')
+
+    expect((await store.loadQueue()).recentEventIds).toEqual(['legacy-message'])
+  })
+
   it('persists credentials and queue checkpoints with restrictive permissions', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-state-'))
     const store = new StateStore(directory)
@@ -72,6 +91,34 @@ describe('persistent state', () => {
       restarted.appendEvents(reloaded, [{ id: 'wake-event' }, { id: 'canonical-answer' }]),
     ).resolves.toMatchObject({ added: 0, consumed: 2 })
     expect(reloaded.events).toEqual([])
+  })
+
+  it('recovers an interrupted identity rebind before exposing cleared delivery state', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-rebind-recovery-'))
+    const store = new StateStore(directory)
+    await store.initialize()
+    const queue = await store.loadQueue()
+    await store.appendEvents(queue, [{ id: 'completed-message' }])
+    await store.shiftEvent(queue, 'completed-message')
+    await store.saveDeliveryIdentity({ schemaVersion: 1, serverId: 'server-1', agentId: 'agent-1' })
+    await writeFile(
+      store.deliveryRebindPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        identity: { schemaVersion: 1, serverId: 'server-2', agentId: 'agent-2' },
+      })}\n`,
+    )
+
+    const restarted = new StateStore(directory)
+    await restarted.initialize()
+
+    await expect(restarted.loadDeliveryIdentity()).resolves.toEqual({
+      schemaVersion: 1,
+      serverId: 'server-2',
+      agentId: 'agent-2',
+    })
+    await expect(restarted.loadQueue()).resolves.toMatchObject({ events: [], recentEventIds: [] })
+    await expect(stat(restarted.deliveryRebindPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('atomically defers a checkpointed head behind newer freshness context', async () => {

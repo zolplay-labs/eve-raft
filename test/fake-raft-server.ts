@@ -30,11 +30,11 @@ function json(response: import('node:http').ServerResponse, status: number, body
 }
 
 export class FakeRaftServer {
-  readonly agentId = 'agent-1'
-  readonly serverId = 'server-1'
+  readonly agentId: string
+  readonly serverId: string
   apiKey = 'raft-api-key'
-  runtimeAgentId: string | undefined = this.agentId
-  runtimeServerId: string | undefined = this.serverId
+  runtimeAgentId: string | undefined
+  runtimeServerId: string | undefined
   eventPolls = 0
   readonly events: Record<string, unknown>[] = []
   readonly sent: SentMessage[] = []
@@ -55,7 +55,16 @@ export class FakeRaftServer {
   private server: Server | null = null
   origin = ''
 
-  constructor(readonly agentName = 'Dex') {}
+  constructor(
+    readonly agentName = 'Dex',
+    agentId = 'agent-1',
+    serverId = 'server-1',
+  ) {
+    this.agentId = agentId
+    this.serverId = serverId
+    this.runtimeAgentId = agentId
+    this.runtimeServerId = serverId
+  }
 
   async start(): Promise<void> {
     this.server = createServer((request, response) => void this.handle(request, response))

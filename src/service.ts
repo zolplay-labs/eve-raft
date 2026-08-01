@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { attachmentMatchesMediaType, stripRaftTransportMarkers } from './protocol.js'
 import { HttpResponseError, RaftClient, RaftFreshnessHoldError, type RaftProfile } from './raft-client.js'
 import {
+  type DeliveryStateIdentity,
   type PendingInputExpiry,
   type PendingInputFile,
   type QueueFile,
@@ -317,7 +318,25 @@ class InvalidPendingInputError extends Error {
   }
 }
 
-class EveClient {
+class AsyncLock {
+  private tail: Promise<void> = Promise.resolve()
+
+  async run<T>(operation: () => T | Promise<T>): Promise<T> {
+    const previous = this.tail
+    let release: () => void = () => undefined
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await previous
+    try {
+      return await operation()
+    } finally {
+      release()
+    }
+  }
+}
+
+class EveClient implements EveRaftTransport<RaftAttachment> {
   constructor(
     readonly origin: string,
     private readonly channelToken: string,
@@ -354,49 +373,148 @@ export interface EveRaftHealth {
   startedAt: string
   state: 'starting' | 'unconfigured' | 'connected' | 'disconnected' | 'error'
   serverUrl: string | null
+  serverId: string | null
+  agentId: string | null
+  agentName: string | null
   queueDepth: number
   lastEventAt: string | null
   lastError: string | null
 }
 
-export interface EveRaftServiceOptions {
+export interface EveRaftServiceOptions<TAttachment = RaftAttachment> {
   stateDirectory: string
-  eveOrigin: string
-  channelToken: string
+  eveOrigin?: string
+  channelToken?: string
+  connectionSource?: EveRaftConnectionSource
+  eve?: EveRaftTransport<TAttachment>
+  prepareAttachment?: EveRaftAttachmentPreparer<TAttachment>
+  deliveryKey?: EveRaftDeliveryKeyFactory
+  adoptLegacyState?: boolean
 }
 
-export class EveRaftService {
+export type EveRaftDeliveryKind = 'expired-input' | 'failed' | 'final' | 'hitl' | 'immediate' | 'invalid-input'
+
+export interface EveRaftDeliveryKeyInput {
+  kind: EveRaftDeliveryKind
+  eventId: string
+  sourceMessageId: string
+  turnId?: string
+  requestKey?: string
+}
+
+export type EveRaftDeliveryKeyFactory = (input: EveRaftDeliveryKeyInput) => string
+
+export interface EveRaftConnectionIdentity {
+  serverUrl: string
+  serverId: string
+  agentId: string
+  agentName: string
+}
+
+export interface EveRaftConnection {
+  identity: EveRaftConnectionIdentity
+  client: RaftClient
+}
+
+export interface EveRaftConnectionSource {
+  load(): EveRaftConnection | null | Promise<EveRaftConnection | null>
+  rejected?(error: Error): void | Promise<void>
+}
+
+export interface EveRaftTransport<TAttachment = RaftAttachment> {
+  dispatch(envelope: RaftEventEnvelope<TAttachment>): Promise<RaftDispatchResponse>
+  stream(path: string, startIndex: number): Promise<Response>
+}
+
+export interface EveRaftAttachmentInput {
+  messageId: string
+  id: string
+  fileName: string
+  mediaType: RaftAttachmentMediaType
+  bytes: Uint8Array
+}
+
+export type EveRaftAttachmentPreparer<TAttachment = RaftAttachment> = (
+  input: EveRaftAttachmentInput,
+) => TAttachment | Promise<TAttachment>
+
+export function prepareInlineAttachment(input: EveRaftAttachmentInput): RaftAttachment {
+  return {
+    id: input.id,
+    fileName: input.fileName,
+    mediaType: input.mediaType,
+    sizeBytes: input.bytes.byteLength,
+    data: Buffer.from(input.bytes).toString('base64'),
+  }
+}
+
+export class EveRaftService<TAttachment = RaftAttachment> {
   readonly health: EveRaftHealth = {
     protocolVersion: RAFT_CHANNEL_PROTOCOL_VERSION,
     startedAt: new Date().toISOString(),
     state: 'starting',
     serverUrl: null,
+    serverId: null,
+    agentId: null,
+    agentName: null,
     queueDepth: 0,
     lastEventAt: null,
     lastError: null,
   }
 
   private readonly store: StateStore
-  private readonly eve: EveClient
-  private credential: RaftCredential | null = null
+  private readonly eve: EveRaftTransport<TAttachment>
+  private readonly connectionSource: EveRaftConnectionSource | null
+  private readonly prepareAttachment: EveRaftAttachmentPreparer<TAttachment>
+  private readonly deliveryKeyFactory: EveRaftDeliveryKeyFactory | null
+  private readonly adoptLegacyState: boolean
+  private readonly connectionLock = new AsyncLock()
+  private credential: EveRaftConnectionIdentity | null = null
   private raft: RaftClient | null = null
   private queue: QueueFile = { schemaVersion: 1, events: [], recentEventIds: [] }
   private pendingEvents: RawRaftMessage[] = []
   private pendingInput: PendingInputFile = { schemaVersion: 1, byReplyTarget: {} }
+  private deliveryIdentity: DeliveryStateIdentity | null = null
   private profileCache = new Map<string, RaftProfile>()
   private initialized = false
 
-  constructor(options: EveRaftServiceOptions) {
+  constructor(options: EveRaftServiceOptions<TAttachment>) {
     this.store = new StateStore(options.stateDirectory)
-    this.eve = new EveClient(options.eveOrigin, options.channelToken)
+    if (options.eve) {
+      this.eve = options.eve
+      if (!options.prepareAttachment) {
+        throw new Error('prepareAttachment is required when a consumer Eve transport is provided')
+      }
+      this.prepareAttachment = options.prepareAttachment
+    } else {
+      if (!options.eveOrigin || !options.channelToken) {
+        throw new Error('eveOrigin and channelToken are required when no consumer Eve transport is provided')
+      }
+      this.eve = new EveClient(options.eveOrigin, options.channelToken) as EveRaftTransport<TAttachment>
+      this.prepareAttachment = prepareInlineAttachment as EveRaftAttachmentPreparer<TAttachment>
+    }
+    this.connectionSource = options.connectionSource ?? null
+    this.deliveryKeyFactory = options.deliveryKey ?? null
+    this.adoptLegacyState = options.adoptLegacyState === true
   }
 
   async initialize(): Promise<void> {
+    await this.connectionLock.run(() => this.initializeUnlocked())
+  }
+
+  private async initializeUnlocked(): Promise<void> {
     if (this.initialized) return
     await this.store.initialize()
-    this.queue = await this.store.loadQueue()
-    this.pendingEvents = (await this.store.loadPendingEvents()).events
-    this.pendingInput = await this.store.loadPendingInput()
+    const [queue, pendingEvents, pendingInput, deliveryIdentity] = await Promise.all([
+      this.store.loadQueue(),
+      this.store.loadPendingEvents(),
+      this.store.loadPendingInput(),
+      this.store.loadDeliveryIdentity(),
+    ])
+    this.queue = queue
+    this.pendingEvents = pendingEvents.events
+    this.pendingInput = pendingInput
+    this.deliveryIdentity = deliveryIdentity
     this.health.queueDepth = this.queue.events.length
     if (!(await this.connectStoredCredential())) {
       if (this.health.state === 'starting') this.health.state = 'unconfigured'
@@ -411,28 +529,54 @@ export class EveRaftService {
     this.health.lastError = 'fatal_runtime_failure'
   }
 
+  async reloadConnection(): Promise<boolean> {
+    return this.connectionLock.run(async () => {
+      this.disconnect('connection_reloading')
+      const connected = await this.connectStoredCredential()
+      if (
+        !connected &&
+        this.health.lastError !== 'credential_rejected' &&
+        this.health.lastError !== 'connection_identity_conflict' &&
+        this.health.lastError !== 'legacy_state_identity_unbound'
+      ) {
+        this.health.state = 'unconfigured'
+        this.health.serverUrl = null
+        this.health.lastError = null
+      }
+      return connected
+    })
+  }
+
   async run(signal: AbortSignal): Promise<void> {
     await this.initialize()
     let failures = 0
     while (!signal.aborted) {
       try {
-        if (this.health.state !== 'connected') {
-          if (this.health.state !== 'error') await this.connectStoredCredential()
-          await delay(EVENT_POLL_MS, signal)
-          continue
-        }
-        if (this.queue.events.length === 0) await this.drain()
-        const processed = await this.processNext()
+        const cycle = await this.connectionLock.run(async () => {
+          try {
+            if (this.health.state !== 'connected') {
+              if (this.health.state !== 'error') await this.connectStoredCredential()
+              return {
+                preserveError:
+                  this.health.lastError === 'credential_rejected' ||
+                  this.health.lastError === 'connection_identity_conflict' ||
+                  this.health.lastError === 'legacy_state_identity_unbound',
+                processed: false,
+              }
+            }
+            if (this.queue.events.length === 0) await this.drainUnlocked()
+            return { preserveError: false, processed: await this.processNextUnlocked() }
+          } catch (error) {
+            if (!isRaftAuthenticationFailure(error)) throw error
+            this.rejectConnection(error)
+            failures = 0
+            return { preserveError: true, processed: false }
+          }
+        })
         failures = 0
-        this.health.lastError = null
-        if (!processed) await delay(EVENT_POLL_MS, signal)
+        if (!cycle.preserveError) this.health.lastError = null
+        if (!cycle.processed) await delay(EVENT_POLL_MS, signal)
       } catch (error) {
-        if (isRaftAuthenticationFailure(error)) {
-          this.disconnect('credential_rejected')
-          failures = 0
-          await delay(EVENT_POLL_MS, signal)
-          continue
-        }
         failures += 1
         this.health.lastError = error instanceof RaftFreshnessHoldError ? 'freshness_hold' : 'transient_failure'
         await delay(Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** Math.min(failures, 5)), signal)
@@ -441,6 +585,10 @@ export class EveRaftService {
   }
 
   async drain(): Promise<number> {
+    return this.connectionLock.run(() => this.drainUnlocked())
+  }
+
+  private async drainUnlocked(): Promise<number> {
     this.assertConnected()
     if (this.pendingEvents.length === 0) {
       const response = await this.raft!.drainOnce()
@@ -456,11 +604,15 @@ export class EveRaftService {
   }
 
   async processNext(): Promise<boolean> {
+    return this.connectionLock.run(() => this.processNextUnlocked())
+  }
+
+  private async processNextUnlocked(): Promise<boolean> {
     this.assertConnected()
     const event = this.queue.events[0]
     if (!event) return false
     if (event.freshnessDeferred) {
-      await this.drain()
+      await this.drainUnlocked()
       const deferred = await this.store.deferHeadEvent(this.queue, event.id, [])
       this.health.queueDepth = this.queue.events.length
       return deferred.moved
@@ -477,7 +629,7 @@ export class EveRaftService {
         await this.raft!.send(
           error.target,
           `Please answer the pending question with an option number or label.\n\n${error.prompt}`,
-          `eve-raft-invalid-input-${hash(event.id)}`,
+          this.deliveryKey({ kind: 'invalid-input', eventId: event.id, sourceMessageId: event.id }),
           error.seenUpToSeq,
         )
         await this.store.shiftEvent(this.queue, event.id)
@@ -559,34 +711,45 @@ export class EveRaftService {
   }
 
   private async connectStoredCredential(): Promise<boolean> {
-    const credential = await this.store.loadCredential()
-    if (!credential) return false
-    const raft = new RaftClient(credential)
+    const connection = this.connectionSource
+      ? await this.connectionSource.load()
+      : await this.store
+          .loadCredential()
+          .then((credential) => (credential ? { identity: credential, client: new RaftClient(credential) } : null))
+    if (!connection) return false
+    const { client: raft, identity } = connection
     let profile: RaftProfile
     let server: Awaited<ReturnType<RaftClient['serverInfo']>>
     try {
-      const identity = await Promise.all([raft.profile(), raft.serverInfo()])
-      profile = identity[0]
-      server = identity[1]
+      const resolved = await Promise.all([raft.profile(), raft.serverInfo()])
+      profile = resolved[0]
+      server = resolved[1]
     } catch (error) {
       if (isRaftAuthenticationFailure(error)) {
-        this.disconnect('credential_rejected')
+        this.rejectConnection(error)
         return false
       }
       throw error
     }
     if (
       profile.kind !== 'agent' ||
-      profile.id !== credential.agentId ||
-      server.runtimeContext?.agentId !== credential.agentId ||
-      server.runtimeContext.serverId !== credential.serverId
+      profile.id !== identity.agentId ||
+      server.runtimeContext?.agentId !== identity.agentId ||
+      server.runtimeContext.serverId !== identity.serverId
     ) {
-      throw new Error('Stored Raft credential does not match the configured agent and server')
+      const error = new Error('Stored Raft credential does not match the configured agent and server')
+      if (!this.connectionSource) throw error
+      this.rejectConnection(error)
+      return false
     }
-    this.credential = credential
+    if (!(await this.bindDeliveryIdentity(identity))) return false
+    this.credential = { ...identity, agentName: profile.name }
     this.raft = raft
     this.health.state = 'connected'
-    this.health.serverUrl = credential.serverUrl
+    this.health.serverUrl = identity.serverUrl
+    this.health.serverId = identity.serverId
+    this.health.agentId = identity.agentId
+    this.health.agentName = profile.name
     this.health.lastError = null
     return true
   }
@@ -596,7 +759,63 @@ export class EveRaftService {
     this.raft = null
     this.profileCache.clear()
     this.health.state = 'disconnected'
+    this.health.serverUrl = null
+    this.health.serverId = null
+    this.health.agentId = null
+    this.health.agentName = null
     this.health.lastError = lastError
+  }
+
+  private rejectConnection(error: Error): void {
+    this.disconnect('credential_rejected')
+    const rejected = this.connectionSource?.rejected
+    if (!rejected) return
+    void Promise.resolve()
+      .then(() => rejected(error))
+      .catch(() => undefined)
+  }
+
+  private async bindDeliveryIdentity(identity: EveRaftConnectionIdentity): Promise<boolean> {
+    const next: DeliveryStateIdentity = {
+      schemaVersion: 1,
+      serverId: identity.serverId,
+      agentId: identity.agentId,
+    }
+    if (!this.deliveryIdentity) {
+      const hasPendingWork =
+        this.queue.events.length > 0 ||
+        this.pendingEvents.length > 0 ||
+        Object.keys(this.pendingInput.byReplyTarget).length > 0
+      if (!this.adoptLegacyState && hasPendingWork) {
+        this.disconnect('legacy_state_identity_unbound')
+        return false
+      }
+      if (!this.adoptLegacyState && this.queue.recentEventIds.length > 0) {
+        await this.store.rebindEmptyDeliveryState(this.queue, next)
+        this.pendingEvents = []
+        this.pendingInput = { schemaVersion: 1, byReplyTarget: {} }
+      } else {
+        await this.store.saveDeliveryIdentity(next)
+      }
+      this.deliveryIdentity = next
+      return true
+    }
+    if (this.deliveryIdentity.serverId === next.serverId && this.deliveryIdentity.agentId === next.agentId) {
+      return true
+    }
+    if (
+      this.queue.events.length > 0 ||
+      this.pendingEvents.length > 0 ||
+      Object.keys(this.pendingInput.byReplyTarget).length > 0
+    ) {
+      this.disconnect('connection_identity_conflict')
+      return false
+    }
+    await this.store.rebindEmptyDeliveryState(this.queue, next)
+    this.pendingEvents = []
+    this.pendingInput = { schemaVersion: 1, byReplyTarget: {} }
+    this.deliveryIdentity = next
+    return true
   }
 
   private async processEvent(event: QueuedRaftEvent): Promise<void> {
@@ -701,6 +920,18 @@ export class EveRaftService {
         if (effectiveTask) throw new PermanentEventError('assigned_task_ignored')
         return
       }
+      if (response.kind === 'immediate') {
+        if (effectiveTask) throw new PermanentEventError('assigned_task_immediate')
+        await this.raft!.send(
+          response.target,
+          response.content,
+          this.deliveryKey({ kind: 'immediate', eventId: event.id, sourceMessageId: response.messageId }),
+          cursor,
+        )
+        await this.bestEffortReaction(reactionMessageId, '✅')
+        await this.bestEffortRemoveReaction(reactionMessageId, '👀')
+        return
+      }
       dispatch = {
         target: response.target,
         messageId: response.messageId,
@@ -733,6 +964,14 @@ export class EveRaftService {
           this.pendingInput.byReplyTarget[target] = requests
           await this.store.savePendingInput(this.pendingInput)
         },
+        deliveryKey: ({ kind, turnId, requestKey }) =>
+          this.deliveryKey({
+            kind,
+            eventId: event.id,
+            sourceMessageId: dispatch.messageId,
+            turnId,
+            requestKey,
+          }),
       })
       await Promise.all(activityWrites)
       if (outcome.kind === 'waiting') return
@@ -740,7 +979,12 @@ export class EveRaftService {
         await this.raft!.send(
           dispatch.target,
           'The Eve agent could not complete that request. Please try again.',
-          `eve-raft-failed-${hash(`${event.id}:${outcome.turnId}`)}`,
+          this.deliveryKey({
+            kind: 'failed',
+            eventId: event.id,
+            sourceMessageId: dispatch.messageId,
+            turnId: outcome.turnId,
+          }),
           cursor,
         )
         if (deliveryTask && taskPhase === 'started')
@@ -751,7 +995,17 @@ export class EveRaftService {
       if (deliveryTask && !outcome.message) throw new PermanentEventError('task_result_missing')
       if (outcome.message) {
         const reply = stripRaftTransportMarkers(outcome.message)
-        await this.raft!.send(dispatch.target, reply, `eve-raft-final-${hash(`${event.id}:${outcome.turnId}`)}`, cursor)
+        await this.raft!.send(
+          dispatch.target,
+          reply,
+          this.deliveryKey({
+            kind: 'final',
+            eventId: event.id,
+            sourceMessageId: dispatch.messageId,
+            turnId: outcome.turnId,
+          }),
+          cursor,
+        )
       }
       await this.store.checkpointHead(this.queue, event.id, {
         replyDelivered: true,
@@ -816,10 +1070,33 @@ export class EveRaftService {
     await this.raft!.send(
       expiry.target,
       'That question expired after the agent restarted. Please ask again.',
-      `eve-raft-expired-input-${hash(event.id)}`,
+      this.deliveryKey({ kind: 'expired-input', eventId: event.id, sourceMessageId: event.id }),
       expiry.seenUpToSeq,
     )
     await this.markFailure(event.taskAnchor?.messageId ?? event.id)
+  }
+
+  private deliveryKey(input: EveRaftDeliveryKeyInput): string {
+    const custom = this.deliveryKeyFactory?.(input)
+    const value = custom ?? this.defaultDeliveryKey(input)
+    if (value.length === 0 || value.length > 240) throw new Error('Eve Raft delivery key is invalid')
+    return value
+  }
+
+  private defaultDeliveryKey(input: EveRaftDeliveryKeyInput): string {
+    switch (input.kind) {
+      case 'expired-input':
+        return `eve-raft-expired-input-${hash(input.eventId)}`
+      case 'invalid-input':
+        return `eve-raft-invalid-input-${hash(input.eventId)}`
+      case 'immediate':
+        return `eve-raft-immediate-${hash(`${input.eventId}:${input.sourceMessageId}`)}`
+      case 'hitl':
+        return `eve-raft-hitl-${hash(`${input.sourceMessageId}:${input.turnId}:${input.requestKey}`)}`
+      case 'failed':
+      case 'final':
+        return `eve-raft-${input.kind}-${hash(`${input.eventId}:${input.turnId}`)}`
+    }
   }
 
   private async normalizeMessage(
@@ -830,7 +1107,7 @@ export class EveRaftService {
       this.credential!.agentId,
       this.credential!.agentName,
     ),
-  ): Promise<RaftMessage> {
+  ): Promise<RaftMessage<TAttachment>> {
     const rawId = rawMessageId(raw)
     const senderName = rawSenderName(raw)
     const channelType = boundedString(raw.channel_type ?? raw.channelType, 100)
@@ -921,13 +1198,13 @@ export class EveRaftService {
     }
   }
 
-  private async attachments(raw: RawRaftMessage): Promise<RaftAttachment[]> {
+  private async attachments(raw: RawRaftMessage): Promise<TAttachment[]> {
     const values = raw.attachments
     if (values === undefined) return []
     if (!Array.isArray(values) || values.length > RAFT_ATTACHMENTS_MAX_COUNT) {
       throw new PermanentEventError('attachment_count_exceeded')
     }
-    const attachments: RaftAttachment[] = []
+    const attachments: TAttachment[] = []
     let total = 0
     for (const value of values) {
       if (!value || typeof value !== 'object') throw new PermanentEventError('attachment_metadata_invalid')
@@ -949,13 +1226,15 @@ export class EveRaftService {
       if (total > RAFT_ATTACHMENTS_MAX_TOTAL_BYTES) throw new PermanentEventError('attachment_total_exceeded')
       const mediaType = mediaTypeFor(bytes, response.headers.get('content-type'))
       if (!mediaType) throw new PermanentEventError('attachment_type_unsupported')
-      attachments.push({
-        id: safeIdentifier(id, 'attachment'),
-        fileName: safeFileName(fileName),
-        mediaType,
-        sizeBytes: bytes.byteLength,
-        data: Buffer.from(bytes).toString('base64'),
-      })
+      attachments.push(
+        await this.prepareAttachment({
+          messageId: safeIdentifier(rawMessageId(raw) ?? 'message', 'message'),
+          id: safeIdentifier(id, 'attachment'),
+          fileName: safeFileName(fileName),
+          mediaType,
+          bytes,
+        }),
+      )
     }
     return attachments
   }

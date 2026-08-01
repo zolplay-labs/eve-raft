@@ -37,7 +37,7 @@ export interface RaftInputResponse {
   text?: string
 }
 
-export interface RaftMessage {
+export interface RaftMessage<TAttachment = RaftAttachment> {
   seq?: number
   messageId: string
   createdAt: string
@@ -57,16 +57,16 @@ export interface RaftMessage {
   taskNumber?: number | null
   taskAssigneeId?: string | null
   taskAssigneeType?: string | null
-  attachments: RaftAttachment[]
+  attachments: TAttachment[]
   inputResponses?: RaftInputResponse[]
 }
 
-export interface RaftEventEnvelope {
+export interface RaftEventEnvelope<TAttachment = RaftAttachment> {
   protocolVersion: typeof RAFT_CHANNEL_PROTOCOL_VERSION
   serverId: string
   agentId: string
   agentName: string
-  message: RaftMessage
+  message: RaftMessage<TAttachment>
 }
 
 export interface EveAuthContext {
@@ -100,7 +100,15 @@ export interface CreateRaftChannelOptions {
 }
 
 export type RaftDispatchResponse =
-  | { accepted: false; reason: 'ignored' }
+  | { accepted: false; reason: 'duplicate' | 'ignored' }
+  | {
+      accepted: true
+      kind: 'immediate'
+      target: string
+      messageId: string
+      content: string
+      task?: { channel: string; number: number } | null
+    }
   | {
       accepted: true
       kind: 'session'

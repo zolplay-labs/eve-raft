@@ -8,7 +8,7 @@
       "type": "registry:item",
       "title": "Raft",
       "description": "Connect an Eve agent to Raft direct conversations, shared mentions, and assigned tasks.",
-      "dependencies": ["@zolplay/eve-raft@^0.1.0"],
+      "dependencies": ["@zolplay/eve-raft@^0.2.0"],
       "files": [
         {
           "path": "registry/channels/raft.ts",

@@ -71,6 +71,54 @@ describe('privacy-safe activity', () => {
       ),
     ).toEqual([])
   })
+
+  it('keeps replay ids stable when an older Eve event has no timestamp', () => {
+    const event = {
+      type: 'action.result',
+      data: {
+        turnId: 'turn-1',
+        status: 'completed',
+        result: { kind: 'tool-result', callId: 'call-1', toolName: 'read_doc' },
+      },
+    }
+
+    const first = activityEventsForEveEvent(event, { sourceMessageId: 'message-1', sessionId: 'session-1' })
+    const replay = activityEventsForEveEvent(event, { sourceMessageId: 'message-1', sessionId: 'session-1' })
+
+    expect(first[0]?.eventId).toBe(replay[0]?.eventId)
+  })
+
+  it('keeps distinct legacy events unique when neither has stream metadata', () => {
+    const first = activityEventsForEveEvent(
+      { type: 'compaction.requested', data: { turnId: 'turn-1', sequence: 1 } },
+      { sourceMessageId: 'message-1', sessionId: 'session-1' },
+    )
+    const second = activityEventsForEveEvent(
+      { type: 'compaction.requested', data: { turnId: 'turn-1', sequence: 2 } },
+      { sourceMessageId: 'message-1', sessionId: 'session-1' },
+    )
+
+    expect(first[0]?.eventId).not.toBe(second[0]?.eventId)
+  })
+
+  it('projects context compaction as a bounded tool lifecycle', () => {
+    const requested = activityEventsForEveEvent(
+      { type: 'compaction.requested', data: { turnId: 'turn-1', privateContent: 'NEVER_TRANSMIT_ME' } },
+      { sourceMessageId: 'message-1', sessionId: 'session-1' },
+    )
+    const completed = activityEventsForEveEvent(
+      { type: 'compaction.completed', data: { turnId: 'turn-1', privateContent: 'NEVER_TRANSMIT_ME' } },
+      { sourceMessageId: 'message-1', sessionId: 'session-1' },
+    )
+
+    expect(requested).toEqual([
+      expect.objectContaining({ hookEventName: 'PreToolUse', toolName: 'context.compaction' }),
+    ])
+    expect(completed).toEqual([
+      expect.objectContaining({ hookEventName: 'PostToolUse', toolName: 'context.compaction' }),
+    ])
+    expect(JSON.stringify([...requested, ...completed])).not.toContain('NEVER_TRANSMIT_ME')
+  })
 })
 
 describe('Eve stream delivery', () => {

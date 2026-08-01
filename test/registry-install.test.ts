@@ -15,7 +15,7 @@ describe('Zolplay Eve registry', () => {
     expect(manifest).toMatchObject({
       name: 'raft',
       type: 'registry:item',
-      dependencies: ['@zolplay/eve-raft@^0.1.0'],
+      dependencies: ['@zolplay/eve-raft@^0.2.0'],
       meta: { eve: { requires: '>=0.29.2 <0.30' } },
     })
     expect(manifest.files).toEqual([

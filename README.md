@@ -1,8 +1,8 @@
 # Eve Raft
 
-Eve Raft connects a [Raft](https://raft.build) external agent to an [Eve](https://eve.dev) agent. It carries direct conversations, shared mentions and threads, assigned tasks, PDF/JPEG/PNG attachments, native activity, and human-input prompts through one durable, co-located process.
+Eve Raft connects a [Raft](https://raft.build) external agent to an [Eve](https://eve.dev) agent. It carries direct conversations, shared mentions and threads, assigned tasks, PDF/JPEG/PNG attachments, native activity, and human-input prompts through a durable runtime.
 
-`@zolplay/eve-raft@0.1.0` is available as an experimental release on npm and through Zolplay's public Eve registry.
+`@zolplay/eve-raft@0.2.0` is available as an experimental release on npm and through Zolplay's public Eve registry.
 
 ## Compatibility
 
@@ -10,7 +10,8 @@ Eve Raft connects a [Raft](https://raft.build) external agent to an [Eve](https:
 - Eve `>=0.29.2 <0.30`
 - Raft External Agents protocol version 1
 - PDF, JPEG, and PNG attachments only
-- One continuously running Eve and Eve Raft process tree with persistent storage
+- Either a co-located Eve process or a consumer-supplied Eve transport
+- Persistent storage for Eve Raft's delivery queue and checkpoints
 
 Credential activation fails closed unless Raft's stable agent and server runtime identities match. Eve 0.30 and later
 require a new compatibility check.
@@ -105,6 +106,48 @@ export default createRaftChannel({
 
 The consumer owns authorization policy. Eve Raft does not include Dex account linking, database access, or Dex-specific permissions.
 
+## Consumer-owned runtime
+
+Applications that already own pairing, credentials, attachment storage, or a private Eve transport can embed the delivery runtime through `@zolplay/eve-raft/consumer`. The consumer supplies the active Raft connection, signed Eve requests, and optional private attachment staging while Eve Raft continues to own polling, queueing, checkpoints, activity, tasks, and restart recovery.
+
+```ts
+import {
+  EveRaftService,
+  HttpResponseError,
+  RaftClient,
+  type EveRaftConnectionSource,
+  type EveRaftTransport,
+} from '@zolplay/eve-raft/consumer'
+
+const connectionSource: EveRaftConnectionSource = {
+  async load() {
+    const credential = await loadActiveCredential()
+    return credential ? { identity: credential, client: new RaftClient(credential) } : null
+  },
+  async rejected(error) {
+    if (error instanceof HttpResponseError) await markCredentialRejected(error.status)
+  },
+}
+
+const eve: EveRaftTransport<PrivateAttachment> = {
+  dispatch: (envelope) => dispatchSignedEveRequest(envelope),
+  stream: (path, startIndex) => openSignedEveStream(path, startIndex),
+}
+
+const service = new EveRaftService<PrivateAttachment>({
+  stateDirectory: '/data',
+  connectionSource,
+  eve,
+  prepareAttachment: (input) => stagePrivateAttachment(input),
+})
+
+await service.run(abortSignal)
+```
+
+Call `service.reloadConnection()` after the consumer activates, rotates, or revokes a credential. The standalone CLI remains the default path and keeps credentials plus inline Base64 attachments inside its own persistent runtime.
+Consumers migrating an existing delivery loop can also provide `deliveryKey` to preserve their prior platform idempotency keys while queued work is replayed.
+Legacy queued or pending state without a `delivery-identity.json` binding fails closed by default. Set `adoptLegacyState: true` only after the consumer has verified that the active stable Raft identity owns that state.
+
 ## Development
 
 ```bash
@@ -115,7 +158,7 @@ pnpm test
 pnpm build
 ```
 
-`pnpm test` includes a real Eve 0.29.2 fixture that installs the root channel from a locally served registry and loads the packed npm artifact. The protocol suite uses a fake Raft server for deterministic delivery, task, attachment, retry, and restart coverage.
+`pnpm test` includes a real Eve 0.29.4 fixture that installs the root channel from a locally served registry and loads the packed npm artifact. The protocol suite uses a fake Raft server for deterministic delivery, task, attachment, retry, and restart coverage.
 
 The standalone fixture is under `fixtures/standalone`. Production Dex is not used or modified by this package's release proof.
 

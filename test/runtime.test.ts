@@ -59,7 +59,7 @@ describe('co-located Eve supervisor', () => {
       const health = await (await fetch(new URL('/health', runtime.healthOrigin))).json()
       expect(health).toMatchObject({ ok: true, eveReady: true, state: 'unconfigured' })
       expect(health).toMatchObject({
-        runtime: { node: process.versions.node, eve: '0.29.2', eveRaft: '0.1.0' },
+        runtime: { node: process.versions.node, eve: '0.29.4', eveRaft: '0.2.0' },
       })
       expect(JSON.stringify(health)).not.toContain('channelToken')
       expect(JSON.stringify(health)).not.toContain('apiKey')

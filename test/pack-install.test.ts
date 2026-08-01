@@ -92,14 +92,14 @@ describe('packed registry installation', () => {
       name?: unknown
       version?: unknown
     }
-    expect(packedManifest).toMatchObject({ name: '@zolplay/eve-raft', version: '0.1.0' })
+    expect(packedManifest).toMatchObject({ name: '@zolplay/eve-raft', version: '0.2.0' })
 
     const fixturePackage = {
       name: 'eve-raft-packed-fixture',
       version: '0.0.0',
       private: true,
       type: 'module',
-      dependencies: { ai: '^7.0.38', eve: '0.29.2' },
+      dependencies: { ai: '^7.0.38', eve: '0.29.4' },
       engines: { node: '>=24' },
     }
     await writeFile(path.join(fixtureDirectory, 'package.json'), `${JSON.stringify(fixturePackage, null, 2)}\n`)
@@ -138,6 +138,16 @@ describe('packed registry installation', () => {
       expect(await readFile(path.join(fixtureDirectory, 'agent/channels/raft.ts'), 'utf8')).toContain(
         "from '@zolplay/eve-raft/channel'",
       )
+      const consumerImport = await execFile(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          "const api = await import('@zolplay/eve-raft/consumer'); console.log(typeof api.EveRaftService)",
+        ],
+        { cwd: fixtureDirectory },
+      )
+      expect(consumerImport.stdout.trim()).toBe('function')
       await execFile('pnpm', ['exec', 'eve', 'build', '--skip-sandbox-prewarm'], {
         cwd: fixtureDirectory,
         env: { ...process.env, EVE_RAFT_CHANNEL_TOKEN: 'packed-channel-token' },
@@ -178,11 +188,17 @@ describe('packed registry installation', () => {
         })
       eve = startFixture()
       const health = await waitForHealth(origin)
-      expect(health).toMatchObject({ ok: true, eveReady: true, state: 'connected', protocolVersion: 1 })
+      expect(health).toMatchObject({
+        ok: true,
+        eveReady: true,
+        state: 'connected',
+        protocolVersion: 1,
+        runtime: { eve: '0.29.4', eveRaft: '0.2.0' },
+        serverId: raft.serverId,
+        agentId: raft.agentId,
+        agentName: raft.agentName,
+      })
       expect(JSON.stringify(health)).not.toContain(raft.apiKey)
-      expect(JSON.stringify(health)).not.toContain(raft.serverId)
-      expect(JSON.stringify(health)).not.toContain(raft.agentId)
-      expect(JSON.stringify(health)).not.toContain(raft.agentName)
 
       raft.events.push({
         seq: 1,

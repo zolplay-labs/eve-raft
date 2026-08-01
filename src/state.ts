@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
 
@@ -79,6 +79,17 @@ export interface PendingInputFile {
 export interface PendingEventsFile {
   schemaVersion: 1
   events: RawRaftMessage[]
+}
+
+export interface DeliveryStateIdentity {
+  schemaVersion: 1
+  serverId: string
+  agentId: string
+}
+
+interface DeliveryStateRebind {
+  schemaVersion: 1
+  identity: DeliveryStateIdentity
 }
 
 const MAX_QUEUE_EVENTS = 1_000
@@ -244,6 +255,8 @@ export class StateStore {
   readonly queuePath: string
   readonly pendingEventsPath: string
   readonly pendingInputPath: string
+  readonly deliveryIdentityPath: string
+  readonly deliveryRebindPath: string
   readonly workflowDirectory: string
 
   constructor(directory: string) {
@@ -253,6 +266,8 @@ export class StateStore {
     this.queuePath = path.join(this.directory, 'queue.json')
     this.pendingEventsPath = path.join(this.directory, 'pending-events.json')
     this.pendingInputPath = path.join(this.directory, 'pending-input.json')
+    this.deliveryIdentityPath = path.join(this.directory, 'delivery-identity.json')
+    this.deliveryRebindPath = path.join(this.directory, 'delivery-rebind.json')
     this.workflowDirectory = path.join(this.directory, 'eve-workflow')
   }
 
@@ -260,6 +275,7 @@ export class StateStore {
     await mkdir(this.directory, { recursive: true, mode: 0o700 })
     await mkdir(this.workflowDirectory, { recursive: true, mode: 0o700 })
     await Promise.all([chmod(this.directory, 0o700), chmod(this.workflowDirectory, 0o700)])
+    await this.recoverDeliveryRebind()
   }
 
   async loadCredential(): Promise<RaftCredential | null> {
@@ -339,6 +355,64 @@ export class StateStore {
       throw new Error('Pending Raft event page exceeds its durable bounds')
     }
     await writeJsonAtomic(this.pendingEventsPath, { schemaVersion: 1, events })
+  }
+
+  async loadDeliveryIdentity(): Promise<DeliveryStateIdentity | null> {
+    const value = await readJson(this.deliveryIdentityPath, 64 * 1024)
+    if (value === null) return null
+    if (
+      !isRecord(value) ||
+      value.schemaVersion !== 1 ||
+      !boundedString(value.serverId, 200) ||
+      !boundedString(value.agentId, 200)
+    ) {
+      throw new Error('Stored Raft delivery identity is invalid')
+    }
+    return value as unknown as DeliveryStateIdentity
+  }
+
+  async saveDeliveryIdentity(identity: DeliveryStateIdentity): Promise<void> {
+    if (
+      identity.schemaVersion !== 1 ||
+      !boundedString(identity.serverId, 200) ||
+      !boundedString(identity.agentId, 200)
+    ) {
+      throw new Error('Raft delivery identity is invalid')
+    }
+    await writeJsonAtomic(this.deliveryIdentityPath, identity)
+  }
+
+  async rebindEmptyDeliveryState(queue: QueueFile, identity: DeliveryStateIdentity): Promise<void> {
+    if (queue.events.length > 0) throw new Error('Cannot rebind non-empty Raft delivery state')
+    await writeJsonAtomic(this.deliveryRebindPath, { schemaVersion: 1, identity } satisfies DeliveryStateRebind)
+    await this.recoverDeliveryRebind()
+    queue.recentEventIds = []
+  }
+
+  private async recoverDeliveryRebind(): Promise<void> {
+    const value = await readJson(this.deliveryRebindPath, 64 * 1024)
+    if (value === null) return
+    if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.identity)) {
+      throw new Error('Stored Raft delivery rebind is invalid')
+    }
+    const identity = value.identity as unknown as DeliveryStateIdentity
+    if (
+      identity.schemaVersion !== 1 ||
+      !boundedString(identity.serverId, 200) ||
+      !boundedString(identity.agentId, 200)
+    ) {
+      throw new Error('Stored Raft delivery rebind is invalid')
+    }
+    const queue = await this.loadQueue()
+    if (queue.events.length > 0) throw new Error('Cannot recover a non-empty Raft delivery rebind')
+    queue.recentEventIds = []
+    await this.saveDeliveryIdentity(identity)
+    await Promise.all([
+      writeJsonAtomic(this.queuePath, queue),
+      writeJsonAtomic(this.pendingEventsPath, { schemaVersion: 1, events: [] }),
+      writeJsonAtomic(this.pendingInputPath, { schemaVersion: 1, byReplyTarget: {} }),
+    ])
+    await unlink(this.deliveryRebindPath)
   }
 
   async appendEvents(

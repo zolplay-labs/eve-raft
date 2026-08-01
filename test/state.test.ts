@@ -7,6 +7,25 @@ import { describe, expect, it } from 'vitest'
 import { StateStore } from '../src/state.ts'
 
 describe('persistent state', () => {
+  it('loads and advances a legacy queue without a recent-event ledger', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-legacy-queue-'))
+    const store = new StateStore(directory)
+    await store.initialize()
+    await writeFile(
+      store.queuePath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        events: [{ id: 'legacy-message', receivedAt: '2026-07-31T00:00:00.000Z', message: { id: 'legacy-message' } }],
+      })}\n`,
+    )
+
+    const queue = await store.loadQueue()
+    expect(queue.recentEventIds).toEqual([])
+    await store.shiftEvent(queue, 'legacy-message')
+
+    expect((await store.loadQueue()).recentEventIds).toEqual(['legacy-message'])
+  })
+
   it('persists credentials and queue checkpoints with restrictive permissions', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'eve-raft-state-'))
     const store = new StateStore(directory)

@@ -317,6 +317,24 @@ class InvalidPendingInputError extends Error {
   }
 }
 
+class AsyncLock {
+  private tail: Promise<void> = Promise.resolve()
+
+  async run<T>(operation: () => T | Promise<T>): Promise<T> {
+    const previous = this.tail
+    let release: () => void = () => undefined
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await previous
+    try {
+      return await operation()
+    } finally {
+      release()
+    }
+  }
+}
+
 class EveClient implements EveRaftTransport<RaftAttachment> {
   constructor(
     readonly origin: string,
@@ -382,7 +400,7 @@ export interface EveRaftConnection {
 
 export interface EveRaftConnectionSource {
   load(): EveRaftConnection | null | Promise<EveRaftConnection | null>
-  rejected?(error: HttpResponseError): void | Promise<void>
+  rejected?(error: Error): void | Promise<void>
 }
 
 export interface EveRaftTransport<TAttachment = RaftAttachment> {
@@ -427,6 +445,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   private readonly eve: EveRaftTransport<TAttachment>
   private readonly connectionSource: EveRaftConnectionSource | null
   private readonly prepareAttachment: EveRaftAttachmentPreparer<TAttachment>
+  private readonly connectionLock = new AsyncLock()
   private credential: EveRaftConnectionIdentity | null = null
   private raft: RaftClient | null = null
   private queue: QueueFile = { schemaVersion: 1, events: [], recentEventIds: [] }
@@ -450,6 +469,10 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   }
 
   async initialize(): Promise<void> {
+    await this.connectionLock.run(() => this.initializeUnlocked())
+  }
+
+  private async initializeUnlocked(): Promise<void> {
     if (this.initialized) return
     await this.store.initialize()
     this.queue = await this.store.loadQueue()
@@ -470,14 +493,16 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   }
 
   async reloadConnection(): Promise<boolean> {
-    this.disconnect('connection_reloading')
-    const connected = await this.connectStoredCredential()
-    if (!connected) {
-      this.health.state = 'unconfigured'
-      this.health.serverUrl = null
-      this.health.lastError = null
-    }
-    return connected
+    return this.connectionLock.run(async () => {
+      this.disconnect('connection_reloading')
+      const connected = await this.connectStoredCredential()
+      if (!connected && this.health.lastError !== 'credential_rejected') {
+        this.health.state = 'unconfigured'
+        this.health.serverUrl = null
+        this.health.lastError = null
+      }
+      return connected
+    })
   }
 
   async run(signal: AbortSignal): Promise<void> {
@@ -485,24 +510,25 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     let failures = 0
     while (!signal.aborted) {
       try {
-        if (this.health.state !== 'connected') {
-          if (this.health.state !== 'error') await this.connectStoredCredential()
-          await delay(EVENT_POLL_MS, signal)
-          continue
-        }
-        if (this.queue.events.length === 0) await this.drain()
-        const processed = await this.processNext()
+        const cycle = await this.connectionLock.run(async () => {
+          try {
+            if (this.health.state !== 'connected') {
+              if (this.health.state !== 'error') await this.connectStoredCredential()
+              return { preserveError: this.health.lastError === 'credential_rejected', processed: false }
+            }
+            if (this.queue.events.length === 0) await this.drainUnlocked()
+            return { preserveError: false, processed: await this.processNextUnlocked() }
+          } catch (error) {
+            if (!isRaftAuthenticationFailure(error)) throw error
+            await this.rejectConnection(error)
+            failures = 0
+            return { preserveError: true, processed: false }
+          }
+        })
         failures = 0
-        this.health.lastError = null
-        if (!processed) await delay(EVENT_POLL_MS, signal)
+        if (!cycle.preserveError) this.health.lastError = null
+        if (!cycle.processed) await delay(EVENT_POLL_MS, signal)
       } catch (error) {
-        if (isRaftAuthenticationFailure(error)) {
-          await this.connectionSource?.rejected?.(error)
-          this.disconnect('credential_rejected')
-          failures = 0
-          await delay(EVENT_POLL_MS, signal)
-          continue
-        }
         failures += 1
         this.health.lastError = error instanceof RaftFreshnessHoldError ? 'freshness_hold' : 'transient_failure'
         await delay(Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** Math.min(failures, 5)), signal)
@@ -511,6 +537,10 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   }
 
   async drain(): Promise<number> {
+    return this.connectionLock.run(() => this.drainUnlocked())
+  }
+
+  private async drainUnlocked(): Promise<number> {
     this.assertConnected()
     if (this.pendingEvents.length === 0) {
       const response = await this.raft!.drainOnce()
@@ -526,11 +556,15 @@ export class EveRaftService<TAttachment = RaftAttachment> {
   }
 
   async processNext(): Promise<boolean> {
+    return this.connectionLock.run(() => this.processNextUnlocked())
+  }
+
+  private async processNextUnlocked(): Promise<boolean> {
     this.assertConnected()
     const event = this.queue.events[0]
     if (!event) return false
     if (event.freshnessDeferred) {
-      await this.drain()
+      await this.drainUnlocked()
       const deferred = await this.store.deferHeadEvent(this.queue, event.id, [])
       this.health.queueDepth = this.queue.events.length
       return deferred.moved
@@ -644,8 +678,7 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       server = resolved[1]
     } catch (error) {
       if (isRaftAuthenticationFailure(error)) {
-        await this.connectionSource?.rejected?.(error)
-        this.disconnect('credential_rejected')
+        await this.rejectConnection(error)
         return false
       }
       throw error
@@ -656,7 +689,10 @@ export class EveRaftService<TAttachment = RaftAttachment> {
       server.runtimeContext?.agentId !== identity.agentId ||
       server.runtimeContext.serverId !== identity.serverId
     ) {
-      throw new Error('Stored Raft credential does not match the configured agent and server')
+      const error = new Error('Stored Raft credential does not match the configured agent and server')
+      if (!this.connectionSource) throw error
+      await this.rejectConnection(error)
+      return false
     }
     this.credential = { ...identity, agentName: profile.name }
     this.raft = raft
@@ -672,6 +708,11 @@ export class EveRaftService<TAttachment = RaftAttachment> {
     this.profileCache.clear()
     this.health.state = 'disconnected'
     this.health.lastError = lastError
+  }
+
+  private async rejectConnection(error: Error): Promise<void> {
+    await this.connectionSource?.rejected?.(error)
+    this.disconnect('credential_rejected')
   }
 
   private async processEvent(event: QueuedRaftEvent): Promise<void> {

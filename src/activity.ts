@@ -29,7 +29,11 @@ function eventTime(event: EveStreamEvent): { occurredAt: string; fingerprint: st
     return { occurredAt: value, fingerprint: value }
   }
   const eventId = boundedString(event.meta?.id, 200)
-  return { occurredAt: new Date().toISOString(), fingerprint: eventId ?? 'untimestamped' }
+  const serialized = JSON.stringify(event)
+  return {
+    occurredAt: new Date().toISOString(),
+    fingerprint: eventId ?? `legacy_${hash(serialized ?? 'untimestamped')}`,
+  }
 }
 
 function toolName(value: unknown): string | null {

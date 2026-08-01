@@ -142,6 +142,104 @@ describe('consumer-owned Eve Raft runtime', () => {
     expect(connectionSource.load).toHaveBeenCalledTimes(2)
   })
 
+  it('waits for an in-flight delivery before reloading the connection', async () => {
+    const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-serialized-reload-'))
+    const credential = {
+      schemaVersion: 1 as const,
+      serverUrl: raft.origin,
+      agentId: raft.agentId,
+      agentName: raft.agentName,
+      serverId: raft.serverId,
+      credentialId: 'credential-1',
+      scopes: ['agent'],
+      apiKey: raft.apiKey,
+      createdAt: '2026-08-01T00:00:00.000Z',
+    }
+    const connectionSource: EveRaftConnectionSource = {
+      load: vi.fn(async () => ({ identity: credential, client: new RaftClient(credential) })),
+    }
+    let releaseDispatch: () => void = () => undefined
+    const dispatchGate = new Promise<void>((resolve) => {
+      releaseDispatch = resolve
+    })
+    let markDispatchStarted: () => void = () => undefined
+    const dispatchStarted = new Promise<void>((resolve) => {
+      markDispatchStarted = resolve
+    })
+    const eve: EveRaftTransport = {
+      async dispatch() {
+        markDispatchStarted()
+        await dispatchGate
+        return { accepted: false, reason: 'ignored' }
+      },
+      stream: vi.fn(),
+    }
+    raft.events.push({
+      seq: 1,
+      id: 'message-1',
+      message_id: 'message-1',
+      timestamp: '2026-08-01T00:00:00.000Z',
+      sender_type: 'human',
+      sender_name: 'cali',
+      channel_type: 'dm',
+      channel_name: 'Dex',
+      content: 'hello',
+    })
+    const service = new EveRaftService({ stateDirectory, connectionSource, eve })
+    await service.initialize()
+    await service.drain()
+
+    const processing = service.processNext()
+    await dispatchStarted
+    let reloadResolved = false
+    const reloading = service.reloadConnection().then((connected) => {
+      reloadResolved = true
+      return connected
+    })
+    await Promise.resolve()
+
+    expect(reloadResolved).toBe(false)
+    releaseDispatch()
+    await expect(processing).resolves.toBe(true)
+    await expect(reloading).resolves.toBe(true)
+    expect(connectionSource.load).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects a consumer connection whose stable Raft identity does not match', async () => {
+    const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-identity-rejected-'))
+    const credential = {
+      schemaVersion: 1 as const,
+      serverUrl: raft.origin,
+      agentId: raft.agentId,
+      agentName: raft.agentName,
+      serverId: raft.serverId,
+      credentialId: 'credential-1',
+      scopes: ['agent'],
+      apiKey: raft.apiKey,
+      createdAt: '2026-08-01T00:00:00.000Z',
+    }
+    const rejected = vi.fn()
+    const connectionSource: EveRaftConnectionSource = {
+      load: vi.fn(async () => ({
+        identity: { ...credential, agentId: 'different-agent' },
+        client: new RaftClient(credential),
+      })),
+      rejected,
+    }
+    const service = new EveRaftService({
+      stateDirectory,
+      connectionSource,
+      eve: { dispatch: vi.fn(), stream: vi.fn() },
+    })
+
+    await service.initialize()
+
+    expect(rejected).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Stored Raft credential does not match the configured agent and server' }),
+    )
+    expect(service.health).toMatchObject({ state: 'disconnected', lastError: 'credential_rejected' })
+  })
+
   it('notifies the consumer when Raft rejects its active connection', async () => {
     const stateDirectory = await mkdtemp(path.join(tmpdir(), 'eve-raft-consumer-rejected-'))
     const credential = {

@@ -88,6 +88,19 @@ describe('privacy-safe activity', () => {
     expect(first[0]?.eventId).toBe(replay[0]?.eventId)
   })
 
+  it('keeps distinct legacy events unique when neither has stream metadata', () => {
+    const first = activityEventsForEveEvent(
+      { type: 'compaction.requested', data: { turnId: 'turn-1', sequence: 1 } },
+      { sourceMessageId: 'message-1', sessionId: 'session-1' },
+    )
+    const second = activityEventsForEveEvent(
+      { type: 'compaction.requested', data: { turnId: 'turn-1', sequence: 2 } },
+      { sourceMessageId: 'message-1', sessionId: 'session-1' },
+    )
+
+    expect(first[0]?.eventId).not.toBe(second[0]?.eventId)
+  })
+
   it('projects context compaction as a bounded tool lifecycle', () => {
     const requested = activityEventsForEveEvent(
       { type: 'compaction.requested', data: { turnId: 'turn-1', privateContent: 'NEVER_TRANSMIT_ME' } },

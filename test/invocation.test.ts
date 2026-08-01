@@ -114,6 +114,30 @@ describe('shared invocation and system tasks', () => {
     expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
   })
 
+  it('resolves a started-task receipt without task metadata', async () => {
+    raft.addTask({ channel: '#tasks', taskNumber: 7, title: 'Ship it', status: 'in_progress', messageId: 'task-7' })
+    raft.events.push(
+      shared({
+        id: 'receipt-1',
+        message_id: 'receipt-1',
+        sender_type: 'system',
+        sender_name: 'system',
+        channel_type: 'dm',
+        channel_name: raft.agentName,
+        content: '📌 @Dex started task #7 "Ship it"',
+      }),
+    )
+
+    await service.drain()
+    await service.processNext()
+
+    expect(raft.sent).toEqual([expect.objectContaining({ target: '#tasks:task-7', content: 'Echo: Ship it' })])
+    expect(raft.reactions).toContainEqual({ messageId: 'task-7', emoji: '✅', operation: 'add' })
+    expect(raft.tasks[0]?.status).toBe('in_review')
+    expect(await service.processNext()).toBe(false)
+    expect(raft.taskClaims.filter((claim) => claim.operation === 'claim')).toHaveLength(1)
+  })
+
   it.each(['missing', 'ambiguous'])('drops a %s system task resolution without blocking later work', async (mode) => {
     if (mode === 'ambiguous') {
       raft.addTask({ channel: '#tasks-a', taskNumber: 7, title: 'Ship it', status: 'todo', messageId: 'task-a' })

@@ -90,17 +90,19 @@ function rawTaskValue(message: RawRaftMessage, camel: string, snake: string): un
   return message[camel] ?? message[snake]
 }
 
-function rawTaskNotice(message: RawRaftMessage): { number: number; title: string } | null {
+function rawTaskNotice(message: RawRaftMessage): { number: number; title: string; assigneeName: string | null } | null {
   if (rawSenderType(message) !== 'system') return null
   const content = boundedString(message.content ?? '', 100_000, true)
   if (content === null) return null
-  const match = /^📋 1 new task created: #([1-9]\d*) "((?:[^"\\\r\n]|\\.)+)"$/u.exec(content)
+  const created = /^📋 1 new task created: #([1-9]\d*) "((?:[^"\\\r\n]|\\.)+)"$/u.exec(content)
+  const started = /^📌 @([^\s@]{1,160}) started task #([1-9]\d*) "((?:[^"\\\r\n]|\\.)+)"$/u.exec(content)
+  const match = created ?? started
   if (!match) return null
-  const number = Number(match[1])
+  const number = Number(match[started ? 2 : 1])
   if (!Number.isSafeInteger(number)) return null
   try {
-    const title = JSON.parse(`"${match[2]}"`) as unknown
-    return typeof title === 'string' && title ? { number, title } : null
+    const title = JSON.parse(`"${match[started ? 3 : 2]}"`) as unknown
+    return typeof title === 'string' && title ? { number, title, assigneeName: started?.[1] ?? null } : null
   } catch {
     return null
   }
@@ -146,20 +148,30 @@ function rawTask(message: RawRaftMessage): { channel: string; number: number; ti
 function rawAssignedTask(
   message: RawRaftMessage,
   agentId: string,
+  agentName: string,
 ): { channel: string; number: number; title: string | null } | null {
+  const notice = rawTaskNotice(message)
   const task = rawTask(message)
   if (!task) return null
-  if (rawTaskNotice(message)) return task
+  if (notice) {
+    return notice.assigneeName === null || notice.assigneeName.toLocaleLowerCase() === agentName.toLocaleLowerCase()
+      ? task
+      : null
+  }
   return rawTaskValue(message, 'taskAssigneeType', 'task_assignee_type') === 'agent' &&
     rawTaskValue(message, 'taskAssigneeId', 'task_assignee_id') === agentId
     ? task
     : null
 }
 
-function checkpointedTask(event: QueuedRaftEvent, agentId: string): { channel: string; number: number } | null {
+function checkpointedTask(
+  event: QueuedRaftEvent,
+  agentId: string,
+  agentName: string,
+): { channel: string; number: number } | null {
   if (event.dispatch?.task) return event.dispatch.task
   const reference = rawTaskReference(event.message)
-  if (!reference || !event.taskAnchor || !rawAssignedTask(event.message, agentId)) return null
+  if (!reference || !event.taskAnchor || !rawAssignedTask(event.message, agentId, agentName)) return null
   return { channel: event.taskAnchor.taskChannel, number: reference.number }
 }
 
@@ -484,7 +496,7 @@ export class EveRaftService {
       ) {
         const checkpointed = this.queue.events[0]
         if (checkpointed?.id === event.id && checkpointed.taskPhase === 'started' && !checkpointed.replyDelivered) {
-          const task = checkpointedTask(checkpointed, this.credential!.agentId)
+          const task = checkpointedTask(checkpointed, this.credential!.agentId, this.credential!.agentName)
           if (task) await this.raft!.unclaimTask(task.channel, task.number, taskMutationKey(event.id, 'unclaim'))
         }
         await this.bestEffortReaction(
@@ -602,7 +614,7 @@ export class EveRaftService {
     if (canonicalId && canonicalId !== event.id && canonicalId !== event.canonicalId) {
       await this.store.checkpointHead(this.queue, event.id, { canonicalId })
     }
-    const task = rawAssignedTask(raw, this.credential!.agentId)
+    const task = rawAssignedTask(raw, this.credential!.agentId, this.credential!.agentName)
     const systemTask = rawSenderType(raw) === 'system' ? task : null
     let taskAnchor = event.taskAnchor
     if (systemTask && !taskAnchor) {
@@ -809,6 +821,7 @@ export class EveRaftService {
     task: { channel: string; number: number; title: string | null } | null = rawAssignedTask(
       raw,
       this.credential!.agentId,
+      this.credential!.agentName,
     ),
   ): Promise<RaftMessage> {
     const rawId = rawMessageId(raw)

@@ -56,7 +56,7 @@
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "lint": "prettier --check .",
-    "test": "vitest run",
+    "test": "vitest run --exclude test/pack-install.test.ts && pnpm test:package",
     "test:package": "vitest run test/pack-install.test.ts",
     "test:watch": "vitest"
   },

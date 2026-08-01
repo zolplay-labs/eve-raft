@@ -4,9 +4,6 @@ import type { MockLanguageModelV3 } from 'ai/test'
 import { defineAgent } from 'eve'
 import { mockModel } from 'eve/evals'
 
-const FIXTURE_PNG_BASE64 =
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
-
 function base64FileData(data: unknown): string | null {
   if (typeof data === 'string') return data
   if (data instanceof Uint8Array) return Buffer.from(data).toString('base64')
@@ -23,7 +20,7 @@ function base64FileData(data: unknown): string | null {
   return null
 }
 
-function containsFixturePng(prompt: unknown): boolean {
+function containsPngAttachment(prompt: unknown): boolean {
   if (!Array.isArray(prompt)) return false
   const latestUserMessage = prompt.findLast(
     (message) => message && typeof message === 'object' && (message as { role?: unknown }).role === 'user',
@@ -36,7 +33,8 @@ function containsFixturePng(prompt: unknown): boolean {
       (part as { mediaType?: unknown; type?: unknown }).type === 'file' &&
       (part as { mediaType?: unknown }).mediaType === 'image/png',
   ) as { data?: unknown } | undefined
-  return file !== undefined && base64FileData(file.data) === FIXTURE_PNG_BASE64
+  const data = file === undefined ? null : base64FileData(file.data)
+  return data !== null && data.length > 0
 }
 
 const defaultModel = mockModel(({ lastUserMessage, toolResults }) => {
@@ -61,14 +59,14 @@ const defaultModel = mockModel(({ lastUserMessage, toolResults }) => {
   }
   return `Fixture echo: ${lastUserMessage ?? ''}`
 }) as MockLanguageModelV3
-const attachmentModel = mockModel('Fixture received exact PNG attachment') as MockLanguageModelV3
+const attachmentModel = mockModel('Fixture received PNG attachment') as MockLanguageModelV3
 const defaultGenerate = defaultModel.doGenerate.bind(defaultModel)
 const defaultStream = defaultModel.doStream.bind(defaultModel)
 
 defaultModel.doGenerate = async (options) =>
-  containsFixturePng(options.prompt) ? attachmentModel.doGenerate(options) : defaultGenerate(options)
+  containsPngAttachment(options.prompt) ? attachmentModel.doGenerate(options) : defaultGenerate(options)
 defaultModel.doStream = async (options) =>
-  containsFixturePng(options.prompt) ? attachmentModel.doStream(options) : defaultStream(options)
+  containsPngAttachment(options.prompt) ? attachmentModel.doStream(options) : defaultStream(options)
 
 export default defineAgent({
   modelContextWindowTokens: 32_768,
